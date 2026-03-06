@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MP4 Atom Comparison</title>
+<script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 16px; }
+h1 { text-align: center; margin-bottom: 16px; color: #c0c0ff; }
+
+.container { display: flex; gap: 12px; flex-wrap: wrap; }
+
+.panel {
+    flex: 1;
+    min-width: 320px;
+    border: 1px solid #333;
+    border-radius: 6px;
+    background: #16213e;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.drop-zone {
+    padding: 32px 16px;
+    text-align: center;
+    border-bottom: 1px solid #333;
+    background: #0f3460;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.drop-zone.dragover { background: #1a5276; }
+.drop-zone .filename { font-weight: bold; color: #7ec8e3; }
+
+.tree {
+    padding: 8px;
+    overflow: auto;
+    flex: 1;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.box-entry { padding-left: 0; }
+.box-entry .toggle {
+    cursor: pointer;
+    user-select: none;
+    color: #888;
+    display: inline-block;
+    width: 1.2em;
+}
+.box-type { color: #5dade2; font-weight: bold; }
+.box-size { color: #999; }
+.box-offset { color: #666; }
+.box-field { color: #aaa; margin-left: 1.2em; }
+.box-field .field-name { color: #82e0aa; }
+.box-field .field-value { color: #d4ac0d; }
+
+.children { display: none; }
+.children.open { display: block; }
+
+.add-btn {
+    display: block;
+    margin: 16px auto;
+    padding: 8px 20px;
+    background: #0f3460;
+    color: #7ec8e3;
+    border: 1px solid #333;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 14px;
+}
+.add-btn:hover { background: #1a5276; }
+</style>
+</head>
+<body>
+
+<h1>MP4 Atom Comparison</h1>
+<button class="add-btn" id="addPanel">+ Add File</button>
+<div class="container" id="container"></div>
+
+<script>
+const container = document.getElementById('container');
+let panelCount = 0;
+
+const SKIP_FIELDS = new Set([
+    'boxes', 'entries', 'samples', 'subBoxNames',
+    'size', 'type', 'start', 'hdr_size',
+]);
+
+function createPanel() {
+    panelCount++;
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+
+    const dropZone = document.createElement('div');
+    dropZone.className = 'drop-zone';
+    dropZone.innerHTML = 'Drop MP4 here or click to browse';
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.mp4,.m4a,.m4v,.mov';
+    fileInput.style.display = 'none';
+
+    const tree = document.createElement('div');
+    tree.className = 'tree';
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0], dropZone, tree);
+    });
+    fileInput.addEventListener('change', () => {
+        if (fileInput.files.length) loadFile(fileInput.files[0], dropZone, tree);
+    });
+
+    panel.appendChild(dropZone);
+    panel.appendChild(fileInput);
+    panel.appendChild(tree);
+    container.appendChild(panel);
+}
+
+function loadFile(file, dropZone, tree) {
+    dropZone.innerHTML = `<span class="filename">${file.name}</span> (${(file.size / 1024).toFixed(1)} KB)`;
+    tree.innerHTML = 'Parsing...';
+
+    const mp4box = MP4Box.createFile();
+
+    mp4box.onReady = function(info) {
+        tree.innerHTML = '';
+        // Get the parsed boxes from the mp4box internal structure
+        const boxes = mp4box.boxes || [];
+        if (boxes.length === 0) {
+            tree.textContent = 'No boxes found';
+            return;
+        }
+        for (const box of boxes) {
+            tree.appendChild(renderBox(box, 0));
+        }
+    };
+
+    mp4box.onError = function(e) {
+        tree.textContent = 'Error: ' + e;
+    };
+
+    const reader = new FileReader();
+    reader.onload = function() {
+        const buf = reader.result;
+        buf.fileStart = 0;
+        mp4box.appendBuffer(buf);
+        mp4box.flush();
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+function renderBox(box, depth) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'box-entry';
+    wrapper.style.paddingLeft = (depth * 16) + 'px';
+
+    const children = box.boxes || [];
+    const hasChildren = children.length > 0;
+
+    const fields = getFields(box);
+    const hasFields = fields.length > 0;
+
+    const header = document.createElement('div');
+    const toggle = `<span class="toggle">${(hasChildren || hasFields) ? '\u25b6' : ' '}</span>`;
+    const offset = box.start != null ? ` <span class="box-offset">@${box.start}</span>` : '';
+    header.innerHTML = `${toggle}<span class="box-type">${box.type || '?'}</span> <span class="box-size">${box.size || '?'} bytes</span>${offset}`;
+    wrapper.appendChild(header);
+
+    const childContainer = document.createElement('div');
+    childContainer.className = 'children';
+
+    // Render fields
+    for (const [key, val] of fields) {
+        const fieldEl = document.createElement('div');
+        fieldEl.className = 'box-field';
+        fieldEl.style.paddingLeft = ((depth + 1) * 16) + 'px';
+        fieldEl.innerHTML = `<span class="field-name">${key}</span>: <span class="field-value">${formatValue(val)}</span>`;
+        childContainer.appendChild(fieldEl);
+    }
+
+    // Render child boxes
+    for (const child of children) {
+        childContainer.appendChild(renderBox(child, depth + 1));
+    }
+
+    if (hasChildren || hasFields) {
+        header.style.cursor = 'pointer';
+        header.addEventListener('click', () => {
+            const isOpen = childContainer.classList.toggle('open');
+            header.querySelector('.toggle').textContent = isOpen ? '\u25bc' : '\u25b6';
+        });
+    }
+
+    wrapper.appendChild(childContainer);
+    return wrapper;
+}
+
+function getFields(box) {
+    const fields = [];
+    for (const key of Object.keys(box)) {
+        if (SKIP_FIELDS.has(key)) continue;
+        const val = box[key];
+        if (val === undefined || val === null) continue;
+        if (typeof val === 'function') continue;
+        if (typeof val === 'object' && !Array.isArray(val) && !(val instanceof ArrayBuffer) && !(val instanceof Uint8Array)) continue;
+        fields.push([key, val]);
+    }
+    return fields;
+}
+
+function formatValue(val) {
+    if (val instanceof ArrayBuffer || val instanceof Uint8Array) {
+        const arr = val instanceof ArrayBuffer ? new Uint8Array(val) : val;
+        if (arr.length <= 16) return '[' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
+        return `[${arr.length} bytes]`;
+    }
+    if (Array.isArray(val)) {
+        if (val.length <= 8) return JSON.stringify(val);
+        return `[${val.length} items]`;
+    }
+    return String(val);
+}
+
+// Start with 3 panels
+createPanel(); createPanel(); createPanel();
+
+document.getElementById('addPanel').addEventListener('click', createPanel);
+</script>
+</body>
+</html>
