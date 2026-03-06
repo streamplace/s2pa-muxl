@@ -17,6 +17,10 @@ echo "--- ffmpeg ---"
 ffmpeg -y -i "$INPUT" -c copy "$OUTDIR/ffmpeg.mp4" 2>&1 | tail -1
 echo
 
+echo "--- ffmpeg (faststart) ---"
+ffmpeg -y -i "$INPUT" -c copy -movflags +faststart "$OUTDIR/ffmpeg-faststart.mp4" 2>&1 | tail -1
+echo
+
 echo "--- gstreamer ---"
 gst-launch-1.0 -e \
     filesrc location="$INPUT" ! qtdemux name=demux \
