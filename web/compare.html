@@ -15,6 +15,7 @@ h1 { text-align: center; margin-bottom: 16px; color: #c0c0ff; }
 .panel {
     flex: 1;
     min-width: 320px;
+    max-height: 90vh;
     border: 1px solid #333;
     border-radius: 6px;
     background: #16213e;
@@ -86,7 +87,7 @@ const container = document.getElementById('container');
 let panelCount = 0;
 
 const SKIP_FIELDS = new Set([
-    'boxes', 'entries', 'samples', 'subBoxNames',
+    'boxes', 'subBoxNames',
     'size', 'type', 'start', 'hdr_size',
 ]);
 
@@ -180,11 +181,7 @@ function renderBox(box, depth) {
 
     // Render fields
     for (const [key, val] of fields) {
-        const fieldEl = document.createElement('div');
-        fieldEl.className = 'box-field';
-        fieldEl.style.paddingLeft = ((depth + 1) * 16) + 'px';
-        fieldEl.innerHTML = `<span class="field-name">${key}</span>: <span class="field-value">${formatValue(val)}</span>`;
-        childContainer.appendChild(fieldEl);
+        childContainer.appendChild(renderField(key, val, depth + 1));
     }
 
     // Render child boxes
@@ -211,23 +208,100 @@ function getFields(box) {
         const val = box[key];
         if (val === undefined || val === null) continue;
         if (typeof val === 'function') continue;
-        if (typeof val === 'object' && !Array.isArray(val) && !(val instanceof ArrayBuffer) && !(val instanceof Uint8Array)) continue;
         fields.push([key, val]);
     }
     return fields;
 }
 
+function isComplex(val) {
+    if (val instanceof ArrayBuffer || val instanceof Uint8Array) return val.byteLength > 16;
+    if (Array.isArray(val)) return val.length > 0 && (val.length > 8 || typeof val[0] === 'object');
+    if (typeof val === 'object' && val !== null) return true;
+    return false;
+}
+
+function renderField(key, val, depth) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'box-field';
+    wrapper.style.paddingLeft = (depth * 16) + 'px';
+
+    if (!isComplex(val)) {
+        wrapper.innerHTML = `<span class="field-name">${esc(key)}</span>: <span class="field-value">${formatValue(val)}</span>`;
+        return wrapper;
+    }
+
+    // Complex value — make it expandable
+    const header = document.createElement('div');
+    header.style.cursor = 'pointer';
+    const summary = summarizeComplex(key, val);
+    header.innerHTML = `<span class="toggle">\u25b6</span><span class="field-name">${esc(key)}</span>: <span class="box-size">${summary}</span>`;
+    wrapper.appendChild(header);
+
+    const childContainer = document.createElement('div');
+    childContainer.className = 'children';
+
+    let populated = false;
+    header.addEventListener('click', () => {
+        if (!populated) {
+            populateComplex(childContainer, val, depth + 1);
+            populated = true;
+        }
+        const isOpen = childContainer.classList.toggle('open');
+        header.querySelector('.toggle').textContent = isOpen ? '\u25bc' : '\u25b6';
+    });
+
+    wrapper.appendChild(childContainer);
+    return wrapper;
+}
+
+function populateComplex(container, val, depth) {
+    if (val instanceof ArrayBuffer || val instanceof Uint8Array) {
+        const arr = val instanceof ArrayBuffer ? new Uint8Array(val) : val;
+        // Show hex dump in rows of 16 bytes
+        for (let i = 0; i < arr.length; i += 16) {
+            const slice = arr.slice(i, Math.min(i + 16, arr.length));
+            const hex = Array.from(slice).map(b => b.toString(16).padStart(2, '0')).join(' ');
+            const ascii = Array.from(slice).map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : '.').join('');
+            const el = document.createElement('div');
+            el.className = 'box-field';
+            el.style.paddingLeft = (depth * 16) + 'px';
+            el.innerHTML = `<span class="box-offset">${i.toString(16).padStart(4, '0')}</span>  <span class="field-value">${hex.padEnd(48)}</span>  <span class="box-size">${esc(ascii)}</span>`;
+            container.appendChild(el);
+        }
+    } else if (Array.isArray(val)) {
+        for (let i = 0; i < val.length; i++) {
+            container.appendChild(renderField(String(i), val[i], depth));
+        }
+    } else if (typeof val === 'object' && val !== null) {
+        for (const k of Object.keys(val)) {
+            const v = val[k];
+            if (v === undefined || v === null || typeof v === 'function') continue;
+            container.appendChild(renderField(k, v, depth));
+        }
+    }
+}
+
+function summarizeComplex(key, val) {
+    if (val instanceof ArrayBuffer || val instanceof Uint8Array) {
+        const len = val instanceof ArrayBuffer ? val.byteLength : val.length;
+        return `${len} bytes`;
+    }
+    if (Array.isArray(val)) return `${val.length} items`;
+    if (typeof val === 'object') return `${Object.keys(val).length} fields`;
+    return '';
+}
+
+function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function formatValue(val) {
     if (val instanceof ArrayBuffer || val instanceof Uint8Array) {
         const arr = val instanceof ArrayBuffer ? new Uint8Array(val) : val;
-        if (arr.length <= 16) return '[' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
-        return `[${arr.length} bytes]`;
+        return '[' + Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join(' ') + ']';
     }
-    if (Array.isArray(val)) {
-        if (val.length <= 8) return JSON.stringify(val);
-        return `[${val.length} items]`;
-    }
-    return String(val);
+    if (Array.isArray(val)) return JSON.stringify(val);
+    return esc(String(val));
 }
 
 // Start with 3 panels
