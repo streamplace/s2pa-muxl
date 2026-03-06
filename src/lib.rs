@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use mp4::{BoxHeader, BoxType, FtypBox, Mp4Reader, MoovBox, WriteBox};
+use mp4::{BoxHeader, BoxType, FtypBox, Mp4Reader, MoovBox, TrakBox, WriteBox};
 
 /// Errors returned by muxl operations.
 #[derive(Debug)]
@@ -51,20 +51,128 @@ fn canonical_ftyp() -> FtypBox {
     }
 }
 
+// Canonical media timescales per handler type.
+// Spec: canonical-form.md § mdhd
+const CANONICAL_VIDEO_TIMESCALE: u32 = 60000;
+const CANONICAL_AUDIO_TIMESCALE: u32 = 48000;
+
+// Rescale a value from one timescale to another. Returns None if lossy.
+fn rescale_exact(value: u64, old_ts: u64, new_ts: u64) -> Option<u64> {
+    if old_ts == new_ts || old_ts == 0 {
+        return Some(value);
+    }
+    let numerator = value * new_ts;
+    if numerator % old_ts != 0 {
+        None
+    } else {
+        Some(numerator / old_ts)
+    }
+}
+
+fn rescale_exact_i32(value: i32, old_ts: u64, new_ts: u64) -> Option<i32> {
+    if old_ts == new_ts || old_ts == 0 {
+        return Some(value);
+    }
+    let abs = value.unsigned_abs() as u64;
+    let scaled = rescale_exact(abs, old_ts, new_ts)?;
+    let result = i32::try_from(scaled).ok()?;
+    Some(if value < 0 { -result } else { result })
+}
+
+// Attempt to rescale a track's media timescale to the canonical value.
+// Returns Ok(true) if rescaled, Ok(false) if already canonical, Err if lossy.
+fn rescale_track_timescale(trak: &mut TrakBox, canonical_ts: u32) -> Result<bool> {
+    let old_ts = trak.mdia.mdhd.timescale as u64;
+    let new_ts = canonical_ts as u64;
+    if old_ts == new_ts {
+        return Ok(false);
+    }
+
+    // Check all stts deltas
+    for entry in &trak.mdia.minf.stbl.stts.entries {
+        if rescale_exact(entry.sample_delta as u64, old_ts, new_ts).is_none() {
+            return Err(Error::InvalidMp4(format!(
+                "cannot losslessly rescale stts delta {} from timescale {old_ts} to {new_ts}",
+                entry.sample_delta
+            )));
+        }
+    }
+
+    // Check all ctts offsets
+    if let Some(ref ctts) = trak.mdia.minf.stbl.ctts {
+        for entry in &ctts.entries {
+            if rescale_exact_i32(entry.sample_offset, old_ts, new_ts).is_none() {
+                return Err(Error::InvalidMp4(format!(
+                    "cannot losslessly rescale ctts offset {} from timescale {old_ts} to {new_ts}",
+                    entry.sample_offset
+                )));
+            }
+        }
+    }
+
+    // Check mdhd duration
+    if rescale_exact(trak.mdia.mdhd.duration, old_ts, new_ts).is_none() {
+        return Err(Error::InvalidMp4(format!(
+            "cannot losslessly rescale mdhd duration {} from timescale {old_ts} to {new_ts}",
+            trak.mdia.mdhd.duration
+        )));
+    }
+
+    // Check elst media_time entries
+    if let Some(ref edts) = trak.edts {
+        if let Some(ref elst) = edts.elst {
+            for entry in &elst.entries {
+                // media_time == u32::MAX or u64::MAX means "empty edit", don't scale
+                if entry.media_time != u32::MAX as u64 && entry.media_time != u64::MAX {
+                    if rescale_exact(entry.media_time, old_ts, new_ts).is_none() {
+                        return Err(Error::InvalidMp4(format!(
+                            "cannot losslessly rescale elst media_time {} from timescale {old_ts} to {new_ts}",
+                            entry.media_time
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // All checks passed — apply the rescaling.
+    for entry in &mut trak.mdia.minf.stbl.stts.entries {
+        entry.sample_delta = rescale_exact(entry.sample_delta as u64, old_ts, new_ts).unwrap() as u32;
+    }
+    if let Some(ref mut ctts) = trak.mdia.minf.stbl.ctts {
+        for entry in &mut ctts.entries {
+            entry.sample_offset = rescale_exact_i32(entry.sample_offset, old_ts, new_ts).unwrap();
+        }
+    }
+    trak.mdia.mdhd.duration = rescale_exact(trak.mdia.mdhd.duration, old_ts, new_ts).unwrap();
+    trak.mdia.mdhd.timescale = canonical_ts;
+
+    if let Some(ref mut edts) = trak.edts {
+        if let Some(ref mut elst) = edts.elst {
+            for entry in &mut elst.entries {
+                if entry.media_time != u32::MAX as u64 && entry.media_time != u64::MAX {
+                    entry.media_time = rescale_exact(entry.media_time, old_ts, new_ts).unwrap();
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 // Canonicalize moov in-place: zero timestamps, canonical hdlr names, strip udta/meta.
 // Spec: canonical-form.md § moov, mvhd, tkhd, mdhd, hdlr
-fn canonicalize_moov(moov: &mut MoovBox) {
+fn canonicalize_moov(moov: &mut MoovBox) -> Result<()> {
     // mvhd: zero timestamps, version 0, timescale 1000, flags 0
     moov.mvhd.version = 0;
     moov.mvhd.flags = 0;
     moov.mvhd.creation_time = 0;
     moov.mvhd.modification_time = 0;
-    // Preserve timescale and duration — they're derived from content.
-    // But normalize timescale to 1000 and recompute duration.
-    let old_timescale = moov.mvhd.timescale as u64;
+    // Normalize movie timescale to 1000 and recompute duration.
+    let old_movie_timescale = moov.mvhd.timescale as u64;
     let new_timescale = 1000u64;
-    if old_timescale != new_timescale && old_timescale != 0 {
-        moov.mvhd.duration = moov.mvhd.duration * new_timescale / old_timescale;
+    if old_movie_timescale != new_timescale && old_movie_timescale != 0 {
+        moov.mvhd.duration = moov.mvhd.duration * new_timescale / old_movie_timescale;
     }
     moov.mvhd.timescale = new_timescale as u32;
 
@@ -77,6 +185,19 @@ fn canonicalize_moov(moov: &mut MoovBox) {
         trak.tkhd.flags = 3; // track_enabled | track_in_movie
         trak.tkhd.creation_time = 0;
         trak.tkhd.modification_time = 0;
+
+        // Rescale elst segment_duration from old movie timescale to new
+        if let Some(ref mut edts) = trak.edts {
+            if let Some(ref mut elst) = edts.elst {
+                for entry in &mut elst.entries {
+                    if old_movie_timescale != 0 {
+                        entry.segment_duration =
+                            entry.segment_duration * new_timescale / old_movie_timescale;
+                    }
+                }
+            }
+        }
+
         // Recompute tkhd.duration in new movie timescale
         let media_timescale = trak.mdia.mdhd.timescale as u64;
         let media_duration = trak.mdia.mdhd.duration;
@@ -101,6 +222,17 @@ fn canonicalize_moov(moov: &mut MoovBox) {
             _ => String::new(),
         };
 
+        // Normalize media timescale to canonical value.
+        // Spec: canonical-form.md § mdhd
+        let canonical_ts = match handler_type.as_str() {
+            "vide" => Some(CANONICAL_VIDEO_TIMESCALE),
+            "soun" => Some(CANONICAL_AUDIO_TIMESCALE),
+            _ => None,
+        };
+        if let Some(ts) = canonical_ts {
+            rescale_track_timescale(trak, ts)?;
+        }
+
         // Strip trak-level meta
         trak.meta = None;
     }
@@ -120,6 +252,8 @@ fn canonicalize_moov(moov: &mut MoovBox) {
     // Strip udta and moov-level meta (tool tags, etc.)
     moov.udta = None;
     moov.meta = None;
+
+    Ok(())
 }
 
 /// Transform an arbitrary MP4 into MUXL canonical form.
@@ -208,7 +342,7 @@ fn canonicalize_from_reader<RS: Read + Seek, WS: Write + Seek>(
     writer.seek(SeekFrom::Start(mdat_end))?;
 
     // 4. Canonicalize moov metadata
-    canonicalize_moov(&mut moov);
+    canonicalize_moov(&mut moov)?;
 
     // 5. Write moov
     moov.write_box(writer)?;

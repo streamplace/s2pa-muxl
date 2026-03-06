@@ -58,7 +58,9 @@ Rationale: flags=3 is the ffmpeg default. gstreamer uses flags=7 (adds track_in_
 
 #### edts (Edit Box)
 
-Preserved from input. Edit lists are content-meaningful (audio priming, A/V sync).
+Preserved from input with rescaling: `segment_duration` values are rescaled from the original movie timescale to the canonical movie timescale (1000). `media_time` values are rescaled from the original media timescale to the canonical media timescale. Empty edits (media_time = -1) are not rescaled.
+
+Edit lists are content-meaningful (audio priming, A/V sync).
 
 #### mdia (Media Box)
 
@@ -68,11 +70,17 @@ Preserved from input. Edit lists are content-meaningful (audio priming, A/V sync
 - **flags**: 0
 - **creation_time**: 0
 - **modification_time**: 0
-- **timescale**: preserved from input (media timescale is content-dependent)
-- **duration**: preserved from input
+- **timescale**: normalized to canonical value per track type (see below)
+- **duration**: recomputed after timescale normalization
 - **language**: preserved from input
 
-Rationale: Media timescale varies by muxer (ffmpeg: 60000, gstreamer: 6000 for the same ~30fps video). We preserve the input's choice because changing timescale requires recomputing all stts/ctts entries, which is a lossy operation.
+Canonical media timescales:
+- **Video**: 60000 (ffmpeg default, works for 24/25/30/60fps and VFR content)
+- **Audio**: 48000 (standard for 48kHz AAC/Opus; matches sample rate)
+
+Timescale normalization is lossless: all stts deltas, ctts offsets, and elst media_time values must scale to exact integers. If any value would require rounding, canonicalization fails with an error.
+
+Rationale: Media timescale varies by muxer (ffmpeg: 60000, gstreamer: 6000 for the same ~30fps video). By normalizing to a canonical timescale, identical content from different muxers produces identical stts/ctts tables.
 
 ##### hdlr (Handler Box)
 
@@ -96,9 +104,9 @@ Preserved from input (always a self-referencing dref).
 ###### stbl (Sample Table Box)
 
 - **stsd**: preserved from input (codec configuration is content)
-- **stts**: preserved from input (timing is content)
+- **stts**: sample deltas rescaled to canonical media timescale (structure preserved)
 - **stss**: preserved from input (keyframe table is content)
-- **ctts**: preserved from input (composition offsets are content)
+- **ctts**: sample offsets rescaled to canonical media timescale (structure preserved)
 - **stsz**: preserved from input (sample sizes are content)
 - **stsc**: canonical — one sample per chunk: `[(first_chunk=1, samples_per_chunk=1, sample_description_index=1)]`
 - **stco/co64**: recomputed from canonical mdat layout. Use stco (32-bit) when all offsets fit in u32, otherwise co64.
