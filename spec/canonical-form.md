@@ -6,72 +6,115 @@ All choices are provisional and subject to revision after playback testing.
 
 ## Top-Level Box Ordering
 
-<!-- Canonical ordering of top-level boxes (ftyp, moov, mdat, etc.) -->
+Canonical order: `ftyp`, `mdat`, `moov`. No `free`, `skip`, or `udta` boxes at top level.
+
+Rationale: mdat-before-moov is the simplest layout (avoids offset chicken-and-egg problems). We may switch to moov-first (faststart) later for streaming, but mdat-first is deterministic without two-pass writing.
 
 ## ftyp (File Type Box)
 
-<!-- Major brand, minor version, compatible brands list -->
+- **major_brand**: `isom`
+- **minor_version**: `0`
+- **compatible_brands**: `[isom, iso2, avc1, mp41]`
+
+Rationale: `isom` is the most universal major brand. Muxer outputs vary widely (isom/512, isom/1, mp42/0). We pick the minimal universal set.
 
 ## moov (Movie Box)
 
 ### Box Ordering Within moov
 
-<!-- Order of mvhd, trak, udta, etc. within moov -->
+`mvhd`, then `trak` boxes sorted by track_id, then nothing else. No `udta`, `meta`, or `iods`.
 
 ### mvhd (Movie Header Box)
 
-<!-- Timescale, duration, version, creation/modification times, matrix, etc. -->
+- **version**: 0 (unless duration overflows u32)
+- **flags**: 0
+- **creation_time**: 0
+- **modification_time**: 0
+- **timescale**: 1000
+- **duration**: max of track durations, in movie timescale
+- **rate**: 1.0 (0x00010000)
+- **volume**: 1.0 (0x0100)
+- **matrix**: identity
+- **next_track_id**: max(track_ids) + 1
+
+Rationale: Timestamps are non-deterministic metadata (they embed wall-clock time). Zero them. Timescale 1000 (millisecond precision) matches ffmpeg default and is sufficient for movie-level duration.
 
 ### trak (Track Box)
 
+Tracks are ordered by track_id (ascending). No trak-level `meta` or `udta`.
+
 #### tkhd (Track Header Box)
 
-<!-- Track ID, flags, dimensions, creation/modification times, matrix -->
+- **version**: 0 (unless duration overflows u32)
+- **flags**: 3 (track_enabled | track_in_movie)
+- **creation_time**: 0
+- **modification_time**: 0
+- **duration**: derived from mdhd duration, scaled to movie timescale
+- **matrix**: preserved from input
+- **width/height**: preserved from input
+- **layer, alternate_group, volume**: preserved from input
+
+Rationale: flags=3 is the ffmpeg default. gstreamer uses flags=7 (adds track_in_preview) — we pick the minimal set.
 
 #### edts (Edit Box)
 
-<!-- Edit list handling -->
+Preserved from input. Edit lists are content-meaningful (audio priming, A/V sync).
 
 #### mdia (Media Box)
 
 ##### mdhd (Media Header Box)
 
-<!-- Timescale, duration, language -->
+- **version**: 0
+- **flags**: 0
+- **creation_time**: 0
+- **modification_time**: 0
+- **timescale**: preserved from input (media timescale is content-dependent)
+- **duration**: preserved from input
+- **language**: preserved from input
+
+Rationale: Media timescale varies by muxer (ffmpeg: 60000, gstreamer: 6000 for the same ~30fps video). We preserve the input's choice because changing timescale requires recomputing all stts/ctts entries, which is a lossy operation.
 
 ##### hdlr (Handler Box)
 
-<!-- Handler type, name string -->
+- **version**: 0
+- **flags**: 0
+- **handler_type**: preserved from input
+- **name**: canonical strings: `"VideoHandler"` for vide, `"SoundHandler"` for soun, `"SubtitleHandler"` for sbtl/text, empty for others
+
+Rationale: Handler name strings vary wildly across muxers and are purely informational.
 
 ##### minf (Media Information Box)
 
 ###### vmhd / smhd (Video/Sound Media Header)
 
-<!-- Media header flags and defaults -->
+Preserved from input.
 
 ###### dinf (Data Information Box)
 
-<!-- Data reference handling -->
+Preserved from input (always a self-referencing dref).
 
 ###### stbl (Sample Table Box)
 
-<!-- This is where most muxer variation occurs -->
+- **stsd**: preserved from input (codec configuration is content)
+- **stts**: preserved from input (timing is content)
+- **stss**: preserved from input (keyframe table is content)
+- **ctts**: preserved from input (composition offsets are content)
+- **stsz**: preserved from input (sample sizes are content)
+- **stsc**: canonical — one sample per chunk: `[(first_chunk=1, samples_per_chunk=1, sample_description_index=1)]`
+- **stco/co64**: recomputed from canonical mdat layout. Use stco (32-bit) when all offsets fit in u32, otherwise co64.
 
-- **stsd** (Sample Description) — codec configuration boxes
-- **stts** (Decoding Time to Sample)
-- **stss** (Sync Sample) — keyframe table
-- **ctts** (Composition Time to Sample) — PTS vs DTS offsets
-- **stsc** (Sample to Chunk)
-- **stsz** (Sample Size)
-- **stco / co64** (Chunk Offset) — 32-bit vs 64-bit decision
+Unknown boxes (sgpd, sbgp, etc.) are currently dropped during round-trip through mp4-rust.
 
 ## mdat (Media Data Box)
 
-<!-- Sample ordering within mdat, alignment, interleaving strategy -->
+Samples are written sequentially per track, in track_id order. All samples for track 1, then all samples for track 2, etc. Each sample is its own chunk.
+
+Rationale: This is the simplest deterministic layout. Not optimal for streaming (interleaved would be better), but trivially reproducible.
 
 ## udta (User Data Box)
 
-<!-- Metadata handling — strip, preserve, or normalize -->
+Stripped entirely. Tool tags (e.g., "Lavf58.76.100") are non-deterministic.
 
 ## free / skip (Free Space Boxes)
 
-<!-- Policy on padding boxes -->
+Stripped entirely.

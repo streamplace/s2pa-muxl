@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::File;
+use std::io::BufReader;
 use std::process;
 
 fn usage() -> ! {
@@ -39,7 +40,7 @@ fn cmd_canonicalize(args: &[String]) -> muxl::Result<()> {
         eprintln!("Usage: muxl canonicalize <input.mp4> <output.mp4>");
         process::exit(1);
     }
-    let input = File::open(&args[0])?;
+    let input = BufReader::new(File::open(&args[0])?);
     let output = File::create(&args[1])?;
     muxl::canonicalize(input, output)
 }
@@ -49,7 +50,7 @@ fn cmd_segment(args: &[String]) -> muxl::Result<()> {
         eprintln!("Usage: muxl segment <input.mp4> <output>");
         process::exit(1);
     }
-    let input = File::open(&args[0])?;
+    let input = BufReader::new(File::open(&args[0])?);
     let output = File::create(&args[1])?;
     muxl::segment(input, output)
 }
@@ -60,9 +61,9 @@ fn cmd_concatenate(args: &[String]) -> muxl::Result<()> {
         process::exit(1);
     }
     let output = File::create(&args[0])?;
-    let mut inputs: Vec<File> = args[1..]
+    let mut inputs: Vec<BufReader<File>> = args[1..]
         .iter()
-        .map(|p| File::open(p).map_err(muxl::Error::from))
+        .map(|p| File::open(p).map(BufReader::new).map_err(muxl::Error::from))
         .collect::<muxl::Result<Vec<_>>>()?;
     muxl::concatenate(&mut inputs, output)
 }
