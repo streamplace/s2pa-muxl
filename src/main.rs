@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
+use std::path::Path;
 use std::process;
 
 fn usage() -> ! {
@@ -8,8 +9,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  canonicalize <input.mp4> <output.mp4>   Canonicalize an MP4 file");
-    eprintln!("  segment <input.mp4> <output>            Split into signable segments");
-    eprintln!("  concatenate <output.mp4> <seg1> [seg2...]  Combine segments into one MP4");
+    eprintln!("  fragment <input.mp4> <output_dir>       Fragment into per-frame CMAF");
     process::exit(1);
 }
 
@@ -21,8 +21,7 @@ fn main() {
 
     let result = match args[1].as_str() {
         "canonicalize" => cmd_canonicalize(&args[2..]),
-        "segment" => cmd_segment(&args[2..]),
-        "concatenate" => cmd_concatenate(&args[2..]),
+        "fragment" => cmd_fragment(&args[2..]),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             usage();
@@ -45,25 +44,25 @@ fn cmd_canonicalize(args: &[String]) -> muxl::Result<()> {
     muxl::canonicalize(input, output)
 }
 
-fn cmd_segment(args: &[String]) -> muxl::Result<()> {
+fn cmd_fragment(args: &[String]) -> muxl::Result<()> {
     if args.len() != 2 {
-        eprintln!("Usage: muxl segment <input.mp4> <output>");
+        eprintln!("Usage: muxl fragment <input.mp4> <output_dir>");
         process::exit(1);
     }
     let input = BufReader::new(File::open(&args[0])?);
-    let output = File::create(&args[1])?;
-    muxl::segment(input, output)
-}
+    let output_dir = Path::new(&args[1]);
+    let stats = muxl::fragment_to_directory(input, output_dir)?;
 
-fn cmd_concatenate(args: &[String]) -> muxl::Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: muxl concatenate <output.mp4> <seg1> [seg2...]");
-        process::exit(1);
+    for track in &stats.tracks {
+        eprintln!(
+            "track {}: {} ({}) — {} samples, {} bytes",
+            track.track_id,
+            track.handler_type,
+            track.timescale,
+            track.sample_count,
+            track.total_bytes
+        );
     }
-    let output = File::create(&args[0])?;
-    let mut inputs: Vec<BufReader<File>> = args[1..]
-        .iter()
-        .map(|p| File::open(p).map(BufReader::new).map_err(muxl::Error::from))
-        .collect::<muxl::Result<Vec<_>>>()?;
-    muxl::concatenate(&mut inputs, output)
+
+    Ok(())
 }

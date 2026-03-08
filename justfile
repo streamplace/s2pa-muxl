@@ -28,6 +28,10 @@ fixtures:
 canonicalize input output:
     cargo run --quiet -- canonicalize {{input}} {{output}}
 
+# Fragment a file into per-frame CMAF
+fragment input output_dir:
+    cargo run --quiet -- fragment {{input}} {{output_dir}}
+
 # Test canonicalization on all fixture files that we expect to work
 test-canon: build fixtures
     #!/usr/bin/env bash
