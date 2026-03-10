@@ -28,7 +28,11 @@ const AUDIO_TIMESCALE: u32 = 48000;
 /// sample entries.
 pub fn catalog_from_mp4<RS: Read + Seek>(mut input: RS) -> Result<Catalog> {
     let moov = read_moov(&mut input)?;
+    catalog_from_moov(&moov)
+}
 
+/// Extract a Catalog from an already-parsed Moov box.
+pub fn catalog_from_moov(moov: &Moov) -> Result<Catalog> {
     let mut video = std::collections::BTreeMap::new();
     let mut audio = std::collections::BTreeMap::new();
 
