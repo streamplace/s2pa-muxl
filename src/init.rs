@@ -9,18 +9,16 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mp4_atom::{
-    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Encode, Esds, Ftyp, Hdlr, Header,
-    Mdhd, Mdia, Minf, Moov, Mp4a, Mvhd, Opus, ReadAtom, ReadFrom, Stbl, Stco, Stsc, Stsd, Stsz,
-    StszSamples, Stts, Tkhd, Trak, Visual, Vmhd, WriteTo,
+    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Encode, Esds, Ftyp, Hdlr,
+    Header, Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom, Stbl, Stco, Stsc,
+    Stsd, Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
 };
 
 use crate::catalog::{AudioTrackConfig, Catalog, VideoTrackConfig};
 use crate::error::{Error, Result};
 
-// Canonical timescales from spec/canonical-form.md
+// Canonical timescale for mvhd (movie-level, not media-level)
 const MOVIE_TIMESCALE: u32 = 1000;
-const VIDEO_TIMESCALE: u32 = 60000;
-const AUDIO_TIMESCALE: u32 = 48000;
 
 /// Extract a Catalog from an MP4 file's moov box.
 ///
@@ -96,6 +94,18 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
         });
     }
 
+    // mvex with trex entries — required for fMP4 playback
+    let trex_entries: Vec<Trex> = track_defs
+        .iter()
+        .map(|td| Trex {
+            track_id: td.track_id(),
+            default_sample_description_index: 1,
+            default_sample_duration: 0,
+            default_sample_size: 0,
+            default_sample_flags: 0,
+        })
+        .collect();
+
     let moov = Moov {
         mvhd: Mvhd {
             creation_time: 0,
@@ -108,7 +118,10 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
             next_track_id: max_track_id + 1,
         },
         meta: None,
-        mvex: None,
+        mvex: Some(Mvex {
+            mehd: None,
+            trex: trex_entries,
+        }),
         trak: traks,
         udta: None,
     };
@@ -163,6 +176,7 @@ pub fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<Moov> {
 /// Extract video track config from a trak.
 fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
     let track_id = trak.tkhd.track_id;
+    let timescale = trak.mdia.mdhd.timescale;
 
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
@@ -180,6 +194,7 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_width: avc1.visual.width as u32,
                     coded_height: avc1.visual.height as u32,
                     track_id,
+                    timescale,
                 }));
             }
             Codec::Av01(av01) => {
@@ -202,6 +217,7 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_width: av01.visual.width as u32,
                     coded_height: av01.visual.height as u32,
                     track_id,
+                    timescale,
                 }));
             }
             _ => continue,
@@ -213,6 +229,7 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
 /// Extract audio track config from a trak.
 fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
     let track_id = trak.tkhd.track_id;
+    let timescale = trak.mdia.mdhd.timescale;
 
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
@@ -224,6 +241,7 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     sample_rate: opus.audio.sample_rate.integer() as u32,
                     number_of_channels: opus.audio.channel_count as u32,
                     track_id,
+                    timescale,
                 }));
             }
             Codec::Mp4a(mp4a) => {
@@ -236,6 +254,7 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     sample_rate: mp4a.audio.sample_rate.integer() as u32,
                     number_of_channels: mp4a.audio.channel_count as u32,
                     track_id,
+                    timescale,
                 }));
             }
             _ => continue,
@@ -255,6 +274,17 @@ fn encode_atom<A: Atom + Encode>(atom: &A) -> Result<Vec<u8>> {
 fn decode_atom<A: Atom + Decode>(bytes: &[u8]) -> Result<A> {
     let mut cursor = Cursor::new(bytes);
     A::decode(&mut cursor).map_err(mp4_err)
+}
+
+/// Canonical dinf box with a single self-contained URL entry.
+fn canonical_dinf() -> Dinf {
+    Dinf {
+        dref: Dref {
+            urls: vec![Url {
+                location: String::new(),
+            }],
+        },
+    }
 }
 
 fn empty_stbl(stsd: Stsd) -> Stbl {
@@ -338,7 +368,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             mdhd: Mdhd {
                 creation_time: 0,
                 modification_time: 0,
-                timescale: VIDEO_TIMESCALE,
+                timescale: config.timescale,
                 duration: 0,
                 language: "und".into(),
             },
@@ -351,7 +381,7 @@ fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
                 smhd: None,
                 nmhd: None,
                 sthd: None,
-                dinf: Dinf::default(),
+                dinf: canonical_dinf(),
                 stbl: empty_stbl(Stsd {
                     codecs: vec![codec],
                 }),
@@ -413,7 +443,7 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             mdhd: Mdhd {
                 creation_time: 0,
                 modification_time: 0,
-                timescale: AUDIO_TIMESCALE,
+                timescale: config.timescale,
                 duration: 0,
                 language: "und".into(),
             },
@@ -426,7 +456,7 @@ fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
                 smhd: Some(Default::default()),
                 nmhd: None,
                 sthd: None,
-                dinf: Dinf::default(),
+                dinf: canonical_dinf(),
                 stbl: empty_stbl(Stsd {
                     codecs: vec![codec],
                 }),

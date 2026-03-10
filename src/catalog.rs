@@ -32,6 +32,9 @@ pub struct VideoTrackConfig {
     pub coded_height: u32,
     /// Track ID for the MP4 container.
     pub track_id: u32,
+    /// Media timescale (ticks per second). Sample durations in fragments are
+    /// expressed in this timescale. Matches Hang catalog container.timescale.
+    pub timescale: u32,
 }
 
 /// Configuration for an audio track.
@@ -47,4 +50,7 @@ pub struct AudioTrackConfig {
     pub number_of_channels: u32,
     /// Track ID for the MP4 container.
     pub track_id: u32,
+    /// Media timescale (ticks per second). Sample durations in fragments are
+    /// expressed in this timescale. Matches Hang catalog container.timescale.
+    pub timescale: u32,
 }

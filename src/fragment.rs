@@ -197,8 +197,109 @@ fn resolve_sample(
 pub struct Frame {
     /// Track ID this frame belongs to.
     pub track_id: u32,
+    /// Whether this is a sync (key) frame.
+    pub is_sync: bool,
     /// Encoded moof+mdat bytes for this single frame.
     pub data: Vec<u8>,
+}
+
+/// Streaming fMP4 reader that parses the init segment upfront, then
+/// yields per-frame fragments on demand.
+///
+/// Only requires `Read` — no seeking. Suitable for processing a live fMP4
+/// stream (e.g. from GStreamer's cmafmux/splitmuxsink).
+pub struct FMP4Reader<R> {
+    reader: R,
+    moov: Moov,
+    catalog: Catalog,
+    track_state: std::collections::HashMap<u32, (u64, u32)>,
+    /// Buffered frames from the current moof+mdat pair (may contain
+    /// multiple frames from multiple tracks).
+    pending: Vec<Frame>,
+}
+
+impl<R: Read> FMP4Reader<R> {
+    /// Create a new FMP4Reader, reading the init segment (ftyp+moov).
+    pub fn new(mut reader: R) -> Result<Self> {
+        let moov = read_moov_streaming(&mut reader)?;
+        let catalog = catalog_from_moov(&moov)?;
+        Ok(FMP4Reader {
+            reader,
+            moov,
+            catalog,
+            track_state: std::collections::HashMap::new(),
+            pending: Vec::new(),
+        })
+    }
+
+    /// The catalog extracted from the init segment.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Read the next per-frame fragment, or None at EOF.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>> {
+        // Return buffered frames first
+        if !self.pending.is_empty() {
+            return Ok(Some(self.pending.remove(0)));
+        }
+
+        // Read the next moof+mdat pair and buffer its frames
+        loop {
+            let header =
+                match <Option<Header> as ReadFrom>::read_from(&mut self.reader).map_err(mp4_err)? {
+                    Some(h) => h,
+                    None => return Ok(None), // EOF
+                };
+
+            if header.kind == Moof::KIND {
+                let moof_box_size = header.size.unwrap_or(0) + 8;
+                let moof =
+                    Moof::read_atom(&header, &mut self.reader).map_err(mp4_err)?;
+
+                // Next box must be mdat
+                let mdat_header = <Option<Header> as ReadFrom>::read_from(&mut self.reader)
+                    .map_err(mp4_err)?
+                    .ok_or_else(|| Error::InvalidMp4("expected mdat after moof".into()))?;
+
+                if mdat_header.kind != mp4_atom::FourCC::new(b"mdat") {
+                    return Err(Error::InvalidMp4(format!(
+                        "expected mdat after moof, got {:?}",
+                        mdat_header.kind
+                    )));
+                }
+
+                let mdat_size = mdat_header
+                    .size
+                    .ok_or_else(|| Error::InvalidMp4("mdat with unknown size".into()))?;
+                let mut mdat_data = vec![0u8; mdat_size];
+                self.reader.read_exact(&mut mdat_data)?;
+
+                process_moof_mdat(
+                    &self.moov,
+                    &moof,
+                    moof_box_size,
+                    &mdat_data,
+                    &mut self.track_state,
+                    &mut |frame| {
+                        self.pending.push(frame);
+                        Ok(())
+                    },
+                )?;
+
+                if !self.pending.is_empty() {
+                    return Ok(Some(self.pending.remove(0)));
+                }
+            } else {
+                // Skip non-moof boxes (styp, sidx, free, etc.)
+                let size = header.size.ok_or_else(|| {
+                    Error::InvalidMp4("box with unknown size in stream".into())
+                })?;
+                let mut skip = vec![0u8; size];
+                self.reader.read_exact(&mut skip)?;
+            }
+        }
+    }
 }
 
 /// Process an fMP4 stream, splitting multi-sample moof+mdat pairs into
@@ -214,65 +315,11 @@ pub fn fragment_fmp4<R: Read>(
     reader: &mut R,
     mut on_frame: impl FnMut(Frame) -> Result<()>,
 ) -> Result<Catalog> {
-    // Read boxes until we find moov, collecting any pre-moov boxes (ftyp, etc.)
-    let moov = read_moov_streaming(reader)?;
-    let catalog = catalog_from_moov(&moov)?;
-
-    // Per-track state: running decode time and sequence number
-    let mut track_state: std::collections::HashMap<u32, (u64, u32)> =
-        std::collections::HashMap::new();
-
-    // Process moof+mdat pairs
-    loop {
-        // Read next box header
-        let header = match <Option<Header> as ReadFrom>::read_from(reader).map_err(mp4_err)? {
-            Some(h) => h,
-            None => break, // EOF
-        };
-
-        if header.kind == Moof::KIND {
-            // The original moof box size (header + body) is needed for
-            // data_offset calculation. header.size is body-only.
-            let moof_box_size = header.size.unwrap_or(0) + 8;
-            let moof = Moof::read_atom(&header, reader).map_err(mp4_err)?;
-
-            // Next box must be mdat
-            let mdat_header =
-                <Option<Header> as ReadFrom>::read_from(reader).map_err(mp4_err)?
-                    .ok_or_else(|| Error::InvalidMp4("expected mdat after moof".into()))?;
-
-            if mdat_header.kind != mp4_atom::FourCC::new(b"mdat") {
-                return Err(Error::InvalidMp4(format!(
-                    "expected mdat after moof, got {:?}",
-                    mdat_header.kind
-                )));
-            }
-
-            // Read the entire mdat payload
-            let mdat_size = mdat_header
-                .size
-                .ok_or_else(|| Error::InvalidMp4("mdat with unknown size".into()))?;
-            let mut mdat_data = vec![0u8; mdat_size];
-            reader.read_exact(&mut mdat_data)?;
-
-            process_moof_mdat(
-                &moov,
-                &moof,
-                moof_box_size,
-                &mdat_data,
-                &mut track_state,
-                &mut on_frame,
-            )?;
-        } else {
-            // Skip non-moof boxes (styp, sidx, free, etc.)
-            let size = header
-                .size
-                .ok_or_else(|| Error::InvalidMp4("box with unknown size in stream".into()))?;
-            let mut skip = vec![0u8; size];
-            reader.read_exact(&mut skip)?;
-        }
+    let mut fmp4 = FMP4Reader::new(reader)?;
+    let catalog = fmp4.catalog().clone();
+    while let Some(frame) = fmp4.next_frame()? {
+        on_frame(frame)?;
     }
-
     Ok(catalog)
 }
 
@@ -374,6 +421,7 @@ fn process_moof_mdat(
 
                 on_frame(Frame {
                     track_id,
+                    is_sync: frame.is_sync,
                     data: frag_buf,
                 })?;
 
