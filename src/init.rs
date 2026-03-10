@@ -134,7 +134,7 @@ fn mp4_err(e: mp4_atom::Error) -> Error {
 }
 
 /// Read through an MP4 file to find and parse the moov box.
-fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<Moov> {
+pub fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<Moov> {
     reader.seek(SeekFrom::Start(0))?;
     loop {
         let header = match <Option<Header> as ReadFrom>::read_from(reader).map_err(mp4_err)? {

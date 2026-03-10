@@ -1,104 +1,167 @@
 //! Fragmentation: flat MP4 → per-frame fMP4 fragments (Hang CMAF style).
 //!
 //! Each track is fragmented independently. Each frame becomes a single
-//! moof+mdat pair. Output is a directory with one subdirectory per track,
-//! containing numbered .cmaf files.
+//! moof+mdat pair. The fragment function produces concatenated moof+mdat
+//! pairs for a single track, suitable for Hang-style per-frame CMAF delivery.
 //!
 //! Spec: architecture.md § Hang CMAF
 
-use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 
-use mp4::{
-    BoxHeader, BoxType, MfhdBox, MoofBox, Mp4Box, Mp4Reader, TfhdBox, TfdtBox, TrafBox, TrunBox,
-    WriteBox,
+use mp4_atom::{
+    CttsEntry, Encode, Mfhd, Moof, StscEntry, StszSamples, SttsEntry, Tfdt, Tfhd, Traf, Trun,
+    TrunEntry,
 };
 
 use crate::error::{Error, Result};
-use crate::sample_table::{expand_ctts, expand_stts};
+use crate::init::read_moov;
 
-/// Information about a single sample extracted from the moov sample tables.
+/// Per-sample metadata extracted from the moov sample tables.
 struct SampleInfo {
     duration: u32,
     size: u32,
     is_sync: bool,
     cts_offset: i32,
-    description_index: u32,
+    /// File offset where this sample's data starts.
+    file_offset: u64,
 }
 
 /// Per-track metadata needed for fragmentation.
 struct TrackInfo {
-    _track_id: u32,
-    handler_type: String,
-    timescale: u32,
     samples: Vec<SampleInfo>,
 }
 
 /// Extract per-sample metadata from a track's sample tables.
-fn extract_track_info<RS: Read + Seek>(
-    reader: &Mp4Reader<RS>,
-    track_id: u32,
-) -> Result<TrackInfo> {
-    let trak = reader
-        .moov
-        .traks
-        .iter()
-        .find(|t| t.tkhd.track_id == track_id)
-        .ok_or_else(|| Error::InvalidMp4(format!("track {track_id} not found")))?;
-
+///
+/// Resolves stsc chunk layout, stco/co64 chunk offsets, stts durations,
+/// ctts offsets, stss sync samples, and stsz sizes into a flat per-sample
+/// list with file offsets for reading sample data.
+fn extract_track_info(trak: &mp4_atom::Trak) -> Result<TrackInfo> {
     let stbl = &trak.mdia.minf.stbl;
-    let sample_count = reader.sample_count(track_id)?;
-
-    let durations = expand_stts(&stbl.stts.entries, sample_count);
-    let cts_offsets = if let Some(ref ctts) = stbl.ctts {
-        expand_ctts(&ctts.entries, sample_count)
-    } else {
-        vec![0i32; sample_count as usize]
-    };
-
-    // Build sync sample set
-    let sync_samples: std::collections::HashSet<u32> = if let Some(ref stss) = stbl.stss {
-        stss.entries.iter().copied().collect()
-    } else {
-        // No stss = all samples are sync
-        (1..=sample_count).collect()
-    };
 
     // Sample sizes
-    let sizes: Vec<u32> = if stbl.stsz.sample_size > 0 {
-        vec![stbl.stsz.sample_size; sample_count as usize]
-    } else {
-        stbl.stsz.sample_sizes.clone()
+    let sizes: Vec<u32> = match &stbl.stsz.samples {
+        StszSamples::Different { sizes } => sizes.clone(),
+        StszSamples::Identical { count, size } => vec![*size; *count as usize],
+    };
+    let sample_count = sizes.len();
+
+    // Sample durations from stts (run-length encoded)
+    let durations = expand_stts(&stbl.stts.entries, sample_count);
+
+    // Composition time offsets from ctts
+    let cts_offsets = match &stbl.ctts {
+        Some(ctts) => expand_ctts(&ctts.entries, sample_count),
+        None => vec![0i32; sample_count],
     };
 
-    // Sample description indices
-    let desc_indices =
-        crate::sample_table::resolve_sample_description_indices(&stbl.stsc.entries, sample_count);
+    // Sync samples from stss (None = all sync)
+    let sync_set: Option<std::collections::HashSet<u32>> = stbl.stss.as_ref().map(|stss| {
+        stss.entries.iter().copied().collect()
+    });
 
-    let mut samples = Vec::with_capacity(sample_count as usize);
-    for i in 0..sample_count as usize {
+    // Chunk offsets from stco or co64
+    let chunk_offsets: Vec<u64> = if let Some(ref stco) = stbl.stco {
+        stco.entries.iter().map(|&o| o as u64).collect()
+    } else if let Some(ref co64) = stbl.co64 {
+        co64.entries.clone()
+    } else {
+        return Err(Error::InvalidMp4("no stco or co64 box".into()));
+    };
+
+    // Resolve stsc to get per-sample file offsets
+    let file_offsets = resolve_sample_offsets(&stbl.stsc.entries, &chunk_offsets, &sizes)?;
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for i in 0..sample_count {
+        let is_sync = match &sync_set {
+            Some(set) => set.contains(&(i as u32 + 1)),
+            None => true, // no stss = all sync
+        };
         samples.push(SampleInfo {
-            duration: *durations.get(i).unwrap_or(&0),
-            size: *sizes.get(i).unwrap_or(&0),
-            is_sync: sync_samples.contains(&(i as u32 + 1)),
-            cts_offset: *cts_offsets.get(i).unwrap_or(&0),
-            description_index: *desc_indices.get(i).unwrap_or(&1),
+            duration: durations[i],
+            size: sizes[i],
+            is_sync,
+            cts_offset: cts_offsets[i],
+            file_offset: file_offsets[i],
         });
     }
 
-    let handler_type = trak.mdia.hdlr.handler_type.to_string();
-    let timescale = trak.mdia.mdhd.timescale;
+    Ok(TrackInfo { samples })
+}
 
-    Ok(TrackInfo {
-        _track_id: track_id,
-        handler_type,
-        timescale,
-        samples,
-    })
+/// Resolve stsc entries + chunk offsets + sample sizes into per-sample file offsets.
+fn resolve_sample_offsets(
+    stsc_entries: &[StscEntry],
+    chunk_offsets: &[u64],
+    sample_sizes: &[u32],
+) -> Result<Vec<u64>> {
+    let sample_count = sample_sizes.len();
+    if sample_count == 0 {
+        return Ok(vec![]);
+    }
+    if stsc_entries.is_empty() {
+        return Err(Error::InvalidMp4("empty stsc table".into()));
+    }
+
+    let mut offsets = Vec::with_capacity(sample_count);
+    let mut sample_idx = 0usize;
+
+    for (i, entry) in stsc_entries.iter().enumerate() {
+        let first_chunk = entry.first_chunk as usize;
+        let next_first_chunk = if i + 1 < stsc_entries.len() {
+            stsc_entries[i + 1].first_chunk as usize
+        } else {
+            chunk_offsets.len() + 1 // run to end of chunks
+        };
+
+        // chunk indices are 1-based
+        for chunk_idx in first_chunk..next_first_chunk {
+            if chunk_idx < 1 || chunk_idx > chunk_offsets.len() {
+                break;
+            }
+            let mut offset = chunk_offsets[chunk_idx - 1];
+            for _ in 0..entry.samples_per_chunk {
+                if sample_idx >= sample_count {
+                    return Ok(offsets);
+                }
+                offsets.push(offset);
+                offset += sample_sizes[sample_idx] as u64;
+                sample_idx += 1;
+            }
+        }
+    }
+
+    Ok(offsets)
+}
+
+/// Expand run-length encoded stts entries into per-sample durations.
+fn expand_stts(entries: &[SttsEntry], sample_count: usize) -> Vec<u32> {
+    let mut durations = Vec::with_capacity(sample_count);
+    for entry in entries {
+        for _ in 0..entry.sample_count {
+            durations.push(entry.sample_delta);
+        }
+    }
+    durations.truncate(sample_count);
+    durations
+}
+
+/// Expand ctts entries into per-sample composition time offsets.
+fn expand_ctts(entries: &[CttsEntry], sample_count: usize) -> Vec<i32> {
+    let mut offsets = Vec::with_capacity(sample_count);
+    for entry in entries {
+        for _ in 0..entry.sample_count {
+            offsets.push(entry.sample_offset);
+        }
+    }
+    offsets.truncate(sample_count);
+    offsets
 }
 
 /// Write a single-sample moof+mdat fragment.
+///
+/// Returns the total bytes written (moof + mdat).
 fn write_frame_fragment<W: Write>(
     writer: &mut W,
     sequence_number: u32,
@@ -107,9 +170,9 @@ fn write_frame_fragment<W: Write>(
     sample: &SampleInfo,
     sample_data: &[u8],
 ) -> Result<u64> {
-    // Sample flags: bit 16 = is_leading, bits 24-25 = sample_depends_on
-    // For sync samples: 0x02000000 (depends on no other)
-    // For non-sync: 0x01010000 (depends on others, is not sync)
+    // Sample flags per ISOBMFF:
+    // sync: 0x02000000 (sample_depends_on=2: does not depend on others)
+    // non-sync: 0x01010000 (sample_depends_on=1 + sample_is_non_sync=1)
     let sample_flags: u32 = if sample.is_sync {
         0x02000000
     } else {
@@ -118,110 +181,119 @@ fn write_frame_fragment<W: Write>(
 
     let has_cts = sample.cts_offset != 0;
 
-    let mut trun_flags = TrunBox::FLAG_SAMPLE_DURATION
-        | TrunBox::FLAG_SAMPLE_SIZE
-        | TrunBox::FLAG_SAMPLE_FLAGS
-        | TrunBox::FLAG_DATA_OFFSET;
-    if has_cts {
-        trun_flags |= TrunBox::FLAG_SAMPLE_CTS;
-    }
-
-    let trun = TrunBox {
-        version: if has_cts { 1 } else { 0 },
-        flags: trun_flags,
-        sample_count: 1,
-        data_offset: Some(0), // placeholder, fixed below
-        first_sample_flags: None,
-        sample_durations: vec![sample.duration],
-        sample_sizes: vec![sample.size],
-        sample_flags: vec![sample_flags],
-        sample_cts: if has_cts {
-            vec![sample.cts_offset as u32]
-        } else {
-            vec![]
-        },
+    let entry = TrunEntry {
+        duration: Some(sample.duration),
+        size: Some(sample.size),
+        flags: Some(sample_flags),
+        cts: if has_cts { Some(sample.cts_offset) } else { None },
     };
 
-    let tfhd = TfhdBox {
-        version: 0,
-        flags: TfhdBox::FLAG_DEFAULT_BASE_IS_MOOF
-            | if sample.description_index != 1 {
-                TfhdBox::FLAG_SAMPLE_DESCRIPTION_INDEX
-            } else {
-                0
+    let moof = Moof {
+        mfhd: Mfhd { sequence_number },
+        traf: vec![Traf {
+            tfhd: Tfhd {
+                track_id,
+                base_data_offset: None,
+                sample_description_index: None,
+                default_sample_duration: None,
+                default_sample_size: None,
+                default_sample_flags: None,
             },
-        track_id,
-        base_data_offset: None,
-        sample_description_index: if sample.description_index != 1 {
-            Some(sample.description_index)
-        } else {
-            None
-        },
-        default_sample_duration: None,
-        default_sample_size: None,
-        default_sample_flags: None,
+            tfdt: Some(Tfdt {
+                base_media_decode_time: base_decode_time,
+            }),
+            trun: vec![Trun {
+                data_offset: Some(0), // placeholder
+                entries: vec![entry],
+            }],
+            ..Default::default()
+        }],
     };
 
-    let tfdt = TfdtBox {
-        version: if base_decode_time > u32::MAX as u64 {
-            1
-        } else {
-            0
-        },
-        flags: 0,
-        base_media_decode_time: base_decode_time,
-    };
+    // Encode moof to measure its size
+    let mut moof_buf = Vec::new();
+    moof.encode(&mut moof_buf).map_err(mp4_err)?;
+    let moof_size = moof_buf.len();
 
-    let traf = TrafBox {
-        tfhd,
-        tfdt: Some(tfdt),
-        trun: Some(trun),
-    };
+    // data_offset = offset from start of moof to start of mdat payload
+    // = moof_size + 8 (mdat header)
+    let data_offset = (moof_size + 8) as i32;
 
-    let moof = MoofBox {
-        mfhd: MfhdBox {
-            version: 0,
-            flags: 0,
-            sequence_number,
-        },
-        trafs: vec![traf],
-    };
-
-    // Calculate moof size to set data_offset (offset from moof start to mdat payload)
-    let moof_size = moof.box_size();
-    let mdat_header_size = 8u64; // standard box header
-    let data_offset = (moof_size + mdat_header_size) as i32;
-
-    // Rebuild with correct data_offset
-    let mut moof = moof;
-    moof.trafs[0].trun.as_mut().unwrap().data_offset = Some(data_offset);
+    // Re-encode with correct data_offset
+    let mut moof_patched = moof;
+    moof_patched.traf[0].trun[0].data_offset = Some(data_offset);
+    let mut moof_buf = Vec::new();
+    moof_patched.encode(&mut moof_buf).map_err(mp4_err)?;
 
     // Write moof
-    moof.write_box(writer)?;
+    writer.write_all(&moof_buf)?;
 
-    // Write mdat
-    let mdat_size = mdat_header_size + sample_data.len() as u64;
-    BoxHeader::new(BoxType::MdatBox, mdat_size).write(writer)?;
+    // Write mdat: 4-byte size (big-endian) + 4-byte type + payload
+    let mdat_total_size = 8u32 + sample_data.len() as u32;
+    writer.write_all(&mdat_total_size.to_be_bytes())?;
+    writer.write_all(b"mdat")?;
     writer.write_all(sample_data)?;
 
-    Ok(moof_size + mdat_size)
+    Ok(moof_buf.len() as u64 + mdat_total_size as u64)
 }
 
-/// Fragment a flat MP4 into per-frame Hang CMAF fragments.
+fn mp4_err(e: mp4_atom::Error) -> Error {
+    Error::InvalidMp4(e.to_string())
+}
+
+/// Fragment a single track from a flat MP4 into per-frame moof+mdat pairs.
+///
+/// Writes concatenated fragments to the writer. Returns the number of samples
+/// written.
+pub fn fragment_track<RS: Read + Seek, W: Write>(
+    mut input: RS,
+    track_id: u32,
+    writer: &mut W,
+) -> Result<u32> {
+    let moov = read_moov(&mut input)?;
+
+    let trak = moov
+        .trak
+        .iter()
+        .find(|t| t.tkhd.track_id == track_id)
+        .ok_or_else(|| Error::InvalidMp4(format!("track {track_id} not found")))?;
+
+    let track_info = extract_track_info(trak)?;
+    let sample_count = track_info.samples.len() as u32;
+    let mut decode_time: u64 = 0;
+
+    for (i, sample) in track_info.samples.iter().enumerate() {
+        // Read sample data from the original file
+        input.seek(SeekFrom::Start(sample.file_offset))?;
+        let mut data = vec![0u8; sample.size as usize];
+        input.read_exact(&mut data)?;
+
+        write_frame_fragment(
+            writer,
+            (i as u32) + 1,
+            track_id,
+            decode_time,
+            sample,
+            &data,
+        )?;
+        decode_time += sample.duration as u64;
+    }
+
+    Ok(sample_count)
+}
+
+/// Fragment all tracks from a flat MP4 into per-frame moof+mdat pairs,
+/// writing each track's fragments to a separate directory.
 ///
 /// Creates `output_dir/<track_id>/` directories, each containing
 /// numbered `.cmaf` files (one per frame).
-///
-/// Also writes `output_dir/<track_id>/init.json` with codec config info.
 pub fn fragment_to_directory<RS: Read + Seek>(
     mut input: RS,
-    output_dir: &Path,
+    output_dir: &std::path::Path,
 ) -> Result<FragmentStats> {
-    let end = input.seek(SeekFrom::End(0))?;
-    input.seek(SeekFrom::Start(0))?;
-    let mut reader = Mp4Reader::read_header(input, end)?;
+    let moov = read_moov(&mut input)?;
 
-    let mut track_ids: Vec<u32> = reader.tracks().keys().copied().collect();
+    let mut track_ids: Vec<u32> = moov.trak.iter().map(|t| t.tkhd.track_id).collect();
     track_ids.sort();
 
     let mut stats = FragmentStats {
@@ -229,83 +301,48 @@ pub fn fragment_to_directory<RS: Read + Seek>(
     };
 
     for &track_id in &track_ids {
-        let track_info = extract_track_info(&reader, track_id)?;
+        let trak = moov
+            .trak
+            .iter()
+            .find(|t| t.tkhd.track_id == track_id)
+            .unwrap();
+
+        let track_info = extract_track_info(trak)?;
         let track_dir = output_dir.join(format!("track{}", track_id));
-        fs::create_dir_all(&track_dir)?;
+        std::fs::create_dir_all(&track_dir)?;
 
         let sample_count = track_info.samples.len() as u32;
         let mut decode_time: u64 = 0;
         let mut total_bytes: u64 = 0;
 
-        for (i, sample_info) in track_info.samples.iter().enumerate() {
+        for (i, sample) in track_info.samples.iter().enumerate() {
             let sample_id = (i as u32) + 1;
 
-            let mp4_sample = reader
-                .read_sample(track_id, sample_id)?
-                .ok_or_else(|| {
-                    Error::InvalidMp4(format!(
-                        "missing sample {sample_id} in track {track_id}"
-                    ))
-                })?;
+            // Read sample data
+            input.seek(SeekFrom::Start(sample.file_offset))?;
+            let mut data = vec![0u8; sample.size as usize];
+            input.read_exact(&mut data)?;
+
+            let mut buf = Vec::new();
+            write_frame_fragment(&mut buf, sample_id, track_id, decode_time, sample, &data)?;
 
             let filename = track_dir.join(format!("{:06}.cmaf", sample_id));
-            let mut buf = Vec::new();
-            write_frame_fragment(
-                &mut buf,
-                sample_id,
-                track_id,
-                decode_time,
-                sample_info,
-                &mp4_sample.bytes,
-            )?;
-
-            fs::write(&filename, &buf)?;
+            std::fs::write(&filename, &buf)?;
             total_bytes += buf.len() as u64;
-            decode_time += sample_info.duration as u64;
+            decode_time += sample.duration as u64;
         }
 
+        let handler = trak.mdia.hdlr.handler;
         stats.tracks.push(TrackStats {
             track_id,
-            handler_type: track_info.handler_type,
-            timescale: track_info.timescale,
+            handler_type: String::from_utf8_lossy(handler.as_ref()).to_string(),
+            timescale: trak.mdia.mdhd.timescale,
             sample_count,
             total_bytes,
         });
     }
 
     Ok(stats)
-}
-
-/// Fragment a flat MP4 into per-frame fragments, writing all frames for a single
-/// track to a writer as concatenated moof+mdat pairs.
-pub fn fragment_track<RS: Read + Seek, W: Write>(
-    mut input: RS,
-    track_id: u32,
-    writer: &mut W,
-) -> Result<u32> {
-    let end = input.seek(SeekFrom::End(0))?;
-    input.seek(SeekFrom::Start(0))?;
-    let mut reader = Mp4Reader::read_header(input, end)?;
-
-    let track_info = extract_track_info(&reader, track_id)?;
-    let sample_count = track_info.samples.len() as u32;
-    let mut decode_time: u64 = 0;
-
-    for (i, sample_info) in track_info.samples.iter().enumerate() {
-        let sample_id = (i as u32) + 1;
-        let mp4_sample = reader
-            .read_sample(track_id, sample_id)?
-            .ok_or_else(|| {
-                Error::InvalidMp4(format!(
-                    "missing sample {sample_id} in track {track_id}"
-                ))
-            })?;
-
-        write_frame_fragment(writer, sample_id, track_id, decode_time, sample_info, &mp4_sample.bytes)?;
-        decode_time += sample_info.duration as u64;
-    }
-
-    Ok(sample_count)
 }
 
 /// Statistics about a fragmentation operation.
@@ -324,34 +361,132 @@ pub struct TrackStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mp4_atom::{Atom, Header, Moof, ReadFrom};
     use std::io::Cursor;
 
-    fn test_file() -> Vec<u8> {
-        std::fs::read("samples/file.mp4").expect("samples/file.mp4 must exist for tests")
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path = format!("samples/fixtures/{}", name);
+        std::fs::read(&path)
+            .or_else(|_| std::fs::read(format!("samples/{}", name)))
+            .unwrap_or_else(|_| panic!("{} must exist for tests", path))
+    }
+
+    #[test]
+    fn test_fragment_track_h264_aac() {
+        let data = read_fixture("h264-aac.mp4");
+        let moov = read_moov(&mut Cursor::new(&data)).unwrap();
+
+        for trak in &moov.trak {
+            let track_id = trak.tkhd.track_id;
+            let mut output = Vec::new();
+            let count = fragment_track(Cursor::new(&data), track_id, &mut output).unwrap();
+            assert!(count > 0, "track {track_id} should have samples");
+            assert!(!output.is_empty(), "track {track_id} should produce output");
+        }
+    }
+
+    #[test]
+    fn test_fragment_produces_moof_mdat_pairs() {
+        let data = read_fixture("h264-aac.mp4");
+        let moov = read_moov(&mut Cursor::new(&data)).unwrap();
+        let track_id = moov.trak[0].tkhd.track_id;
+
+        let mut output = Vec::new();
+        fragment_track(Cursor::new(&data), track_id, &mut output).unwrap();
+
+        // Parse the output: should be alternating moof+mdat
+        let mut cursor = Cursor::new(&output);
+        let mut fragment_count = 0u32;
+
+        while cursor.position() < output.len() as u64 {
+            let h1 = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                .unwrap()
+                .expect("expected moof header");
+            assert_eq!(h1.kind, Moof::KIND, "expected moof, got {:?}", h1.kind);
+            let moof_body_size = h1.size.unwrap();
+            cursor.seek(SeekFrom::Current(moof_body_size as i64)).unwrap();
+
+            let h2 = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                .unwrap()
+                .expect("expected mdat header");
+            assert_eq!(
+                h2.kind,
+                mp4_atom::FourCC::new(b"mdat"),
+                "expected mdat, got {:?}",
+                h2.kind
+            );
+            let mdat_body_size = h2.size.unwrap();
+            cursor.seek(SeekFrom::Current(mdat_body_size as i64)).unwrap();
+
+            fragment_count += 1;
+        }
+
+        assert!(fragment_count > 0, "should have produced fragments");
+    }
+
+    #[test]
+    fn test_fragment_sample_data_preserved() {
+        let data = read_fixture("h264-aac.mp4");
+        let moov = read_moov(&mut Cursor::new(&data)).unwrap();
+        let track_id = moov.trak[0].tkhd.track_id;
+
+        // Extract expected sample data from original file
+        let trak = &moov.trak[0];
+        let track_info = extract_track_info(trak).unwrap();
+
+        let mut output = Vec::new();
+        fragment_track(Cursor::new(&data), track_id, &mut output).unwrap();
+
+        // For each fragment, verify the mdat payload matches the original sample data
+        let mut cursor = Cursor::new(&output);
+        for (i, sample) in track_info.samples.iter().enumerate().take(5) {
+            // Read original sample
+            let mut original = vec![0u8; sample.size as usize];
+            let mut input = Cursor::new(&data);
+            input.seek(SeekFrom::Start(sample.file_offset)).unwrap();
+            input.read_exact(&mut original).unwrap();
+
+            // Skip moof
+            let h1 = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                .unwrap()
+                .unwrap();
+            cursor
+                .seek(SeekFrom::Current(h1.size.unwrap() as i64))
+                .unwrap();
+
+            // Read mdat
+            let h2 = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                .unwrap()
+                .unwrap();
+            let mdat_size = h2.size.unwrap();
+            let mut mdat_payload = vec![0u8; mdat_size];
+            Read::read_exact(&mut cursor, &mut mdat_payload).unwrap();
+
+            assert_eq!(
+                mdat_payload, original,
+                "sample {} data mismatch in track {}",
+                i + 1,
+                track_id
+            );
+        }
     }
 
     #[test]
     fn test_fragment_to_directory() {
-        let data = test_file();
-        let input = Cursor::new(data);
-        let tmp = tempdir();
-        let stats = fragment_to_directory(input, tmp.path()).unwrap();
+        let data = read_fixture("h264-aac.mp4");
+        let tmp = TempDir::new();
+        let stats = fragment_to_directory(Cursor::new(data), tmp.path()).unwrap();
 
-        assert!(stats.tracks.len() >= 1, "should have at least one track");
+        assert!(!stats.tracks.is_empty(), "should have at least one track");
 
         for track in &stats.tracks {
             let track_dir = tmp.path().join(format!("track{}", track.track_id));
             assert!(track_dir.is_dir());
 
-            // Check that the right number of fragment files exist
-            let files: Vec<_> = fs::read_dir(&track_dir)
+            let files: Vec<_> = std::fs::read_dir(&track_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext == "cmaf")
-                })
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "cmaf"))
                 .collect();
             assert_eq!(
                 files.len(),
@@ -364,77 +499,25 @@ mod tests {
     }
 
     #[test]
-    fn test_fragments_are_valid_fmp4() {
-        let data = test_file();
-        let input = Cursor::new(data);
-        let tmp = tempdir();
-        let stats = fragment_to_directory(input, tmp.path()).unwrap();
+    fn test_fragment_all_fixtures() {
+        for name in &[
+            "h264-aac.mp4",
+            "h264-opus.mp4",
+            "h264-aac-25fps.mp4",
+            "h264-video-only.mp4",
+            "opus-audio-only.mp4",
+        ] {
+            let data = read_fixture(name);
+            let moov = read_moov(&mut Cursor::new(&data)).unwrap();
 
-        // Read back a fragment and verify it has moof + mdat structure
-        let track = &stats.tracks[0];
-        let frag_path = tmp
-            .path()
-            .join(format!("track{}/000001.cmaf", track.track_id));
-        let frag_data = fs::read(&frag_path).unwrap();
-        let mut cursor = Cursor::new(&frag_data);
-
-        // First box should be moof
-        let header1 = mp4::BoxHeader::read(&mut cursor).unwrap();
-        assert_eq!(header1.name, BoxType::MoofBox);
-
-        // Skip to next box — should be mdat
-        cursor.set_position(header1.size);
-        let header2 = mp4::BoxHeader::read(&mut cursor).unwrap();
-        assert_eq!(header2.name, BoxType::MdatBox);
-
-        // Total size should match
-        assert_eq!(
-            header1.size + header2.size,
-            frag_data.len() as u64,
-            "fragment size should be moof + mdat"
-        );
-    }
-
-    #[test]
-    fn test_fragment_sample_data_preserved() {
-        // Verify that sample bytes in fragments match the original
-        let data = test_file();
-        let input1 = Cursor::new(data.clone());
-        let tmp = tempdir();
-        let stats = fragment_to_directory(input1, tmp.path()).unwrap();
-
-        let end = data.len() as u64;
-        let mut reader = Mp4Reader::read_header(Cursor::new(data), end).unwrap();
-
-        for track in &stats.tracks {
-            for sample_id in 1..=track.sample_count.min(5) {
-                // Check first 5 samples
-                let original = reader
-                    .read_sample(track.track_id, sample_id)
-                    .unwrap()
-                    .unwrap();
-
-                let frag_path = tmp
-                    .path()
-                    .join(format!("track{}/{:06}.cmaf", track.track_id, sample_id));
-                let frag_data = fs::read(&frag_path).unwrap();
-
-                // The sample data should be the last N bytes of the fragment (in mdat)
-                let sample_bytes =
-                    &frag_data[frag_data.len() - original.bytes.len()..];
-                assert_eq!(
-                    sample_bytes,
-                    &original.bytes[..],
-                    "sample {} data mismatch in track {}",
-                    sample_id,
-                    track.track_id
-                );
+            for trak in &moov.trak {
+                let track_id = trak.tkhd.track_id;
+                let mut output = Vec::new();
+                let count = fragment_track(Cursor::new(&data), track_id, &mut output)
+                    .unwrap_or_else(|e| panic!("{name} track {track_id}: {e}"));
+                assert!(count > 0, "{name} track {track_id}: no samples");
             }
         }
-    }
-
-    fn tempdir() -> TempDir {
-        TempDir::new()
     }
 
     struct TempDir(std::path::PathBuf);
@@ -443,22 +526,25 @@ mod tests {
         fn new() -> Self {
             let mut path = std::env::temp_dir();
             path.push(format!("muxl-test-{}", std::process::id()));
-            path.push(format!("{}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()));
-            fs::create_dir_all(&path).unwrap();
+            path.push(format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }
 
-        fn path(&self) -> &Path {
+        fn path(&self) -> &std::path::Path {
             &self.0
         }
     }
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }
