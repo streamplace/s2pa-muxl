@@ -1,15 +1,14 @@
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::fs;
+use std::io::Cursor;
 use std::process;
 
 fn usage() -> ! {
     eprintln!("Usage: muxl <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  canonicalize <input.mp4> <output.mp4>   Canonicalize an MP4 file");
-    eprintln!("  fragment <input.mp4> <output_dir>       Fragment into per-frame CMAF");
+    eprintln!("  catalog <input.mp4>                     Extract catalog from MP4");
+    eprintln!("  init <input.mp4> <output_init.mp4>      Build canonical init segment");
     process::exit(1);
 }
 
@@ -20,8 +19,8 @@ fn main() {
     }
 
     let result = match args[1].as_str() {
-        "canonicalize" => cmd_canonicalize(&args[2..]),
-        "fragment" => cmd_fragment(&args[2..]),
+        "catalog" => cmd_catalog(&args[2..]),
+        "init" => cmd_init(&args[2..]),
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             usage();
@@ -34,35 +33,39 @@ fn main() {
     }
 }
 
-fn cmd_canonicalize(args: &[String]) -> muxl::Result<()> {
-    if args.len() != 2 {
-        eprintln!("Usage: muxl canonicalize <input.mp4> <output.mp4>");
+fn cmd_catalog(args: &[String]) -> muxl::Result<()> {
+    if args.len() != 1 {
+        eprintln!("Usage: muxl catalog <input.mp4>");
         process::exit(1);
     }
-    let input = BufReader::new(File::open(&args[0])?);
-    let output = File::create(&args[1])?;
-    muxl::canonicalize(input, output)
-}
+    let data = fs::read(&args[0])?;
+    let catalog = muxl::catalog_from_mp4(Cursor::new(data))?;
 
-fn cmd_fragment(args: &[String]) -> muxl::Result<()> {
-    if args.len() != 2 {
-        eprintln!("Usage: muxl fragment <input.mp4> <output_dir>");
-        process::exit(1);
-    }
-    let input = BufReader::new(File::open(&args[0])?);
-    let output_dir = Path::new(&args[1]);
-    let stats = muxl::fragment_to_directory(input, output_dir)?;
-
-    for track in &stats.tracks {
+    for (name, v) in &catalog.video {
         eprintln!(
-            "track {}: {} ({}) — {} samples, {} bytes",
-            track.track_id,
-            track.handler_type,
-            track.timescale,
-            track.sample_count,
-            track.total_bytes
+            "video \"{name}\": {} {}x{} (track {}, {} desc bytes)",
+            v.codec, v.coded_width, v.coded_height, v.track_id, v.description.len()
+        );
+    }
+    for (name, a) in &catalog.audio {
+        eprintln!(
+            "audio \"{name}\": {} {}Hz {}ch (track {}, {} desc bytes)",
+            a.codec, a.sample_rate, a.number_of_channels, a.track_id, a.description.len()
         );
     }
 
+    Ok(())
+}
+
+fn cmd_init(args: &[String]) -> muxl::Result<()> {
+    if args.len() != 2 {
+        eprintln!("Usage: muxl init <input.mp4> <output_init.mp4>");
+        process::exit(1);
+    }
+    let data = fs::read(&args[0])?;
+    let catalog = muxl::catalog_from_mp4(Cursor::new(data))?;
+    let init = muxl::build_init_segment(&catalog)?;
+    fs::write(&args[1], &init)?;
+    eprintln!("Wrote {} bytes", init.len());
     Ok(())
 }
