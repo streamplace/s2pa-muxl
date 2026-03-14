@@ -2,6 +2,19 @@
 
 Issues that need further investigation before the canonical form is finalized.
 
+## Timescale normalization
+
+Currently, media timescales are passed through from the source (e.g., 16000 for 60fps video from GStreamer, 60000 from ffmpeg). This means the same logical content from different encoders produces different timescales in the init segment and different duration values in trun entries.
+
+For true canonicalization (byte-identical output from identical content regardless of source), we'd need to normalize to a canonical timescale per track type and rescale all durations accordingly.
+
+Considerations:
+1. **Passthrough** (current): simple, no rounding errors, but timescale is encoder-dependent. Two files with identical frames but different source encoders won't produce identical MUXL output.
+2. **Canonical timescale**: e.g., 60000 for video, 48000 for audio. Requires rescaling all sample durations, which can introduce rounding errors for timescales that don't divide evenly. Risk of accumulated drift over long streams.
+3. **Least-common-multiple approach**: could pick a timescale that's a multiple of common values (e.g., 240000 for video covers 24/25/30/60fps). Larger numbers, but exact for common frame rates.
+
+Timescale passthrough is fine for the livestream ingest use case (single source encoder), but needs resolution for cross-encoder canonicalization.
+
 ## Audio priming sample handling
 
 Muxers disagree on how to handle Opus/AAC encoder delay (priming samples):

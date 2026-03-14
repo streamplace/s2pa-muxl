@@ -6,15 +6,17 @@ All choices are provisional and subject to revision after playback testing.
 
 ## MUXL Segment
 
-A MUXL segment contains one GoP of content. It is constructed from per-frame fragments (Hang CMAF style) grouped by GoP and assembled in a deterministic order.
+A MUXL segment contains one GoP of content. It is constructed from per-frame fragments grouped by GoP. Each frame gets its own moof+mdat pair.
 
 ```
-moof(track 1) + mdat(track 1)
-moof(track 2) + mdat(track 2)
+moof(frame 1, track 1) + mdat(frame 1, track 1)
+moof(frame 1, track 2) + mdat(frame 1, track 2)
+moof(frame 2, track 1) + mdat(frame 2, track 1)
+moof(frame 2, track 2) + mdat(frame 2, track 2)
 ...
 ```
 
-Each track gets its own moof+mdat pair. Tracks are ordered by track_id (ascending). Segments are blindly concatenatable by byte appending.
+Frames are interleaved in decode order across tracks. Segments are blindly concatenatable by byte appending.
 
 Track initialization metadata (codec config, timescales) is out-of-band — either in the archive file's init segment or from an external source.
 
@@ -24,13 +26,13 @@ Each segment begins at a video sync sample (keyframe). Audio samples are grouped
 
 ### moof
 
-Each moof covers exactly one track for one GoP.
+Each moof covers exactly one sample (frame) from one track.
 
 - **mfhd**: sequence_number, 1-based, incrementing globally across the stream
 - **traf**: exactly one per moof
-  - **tfhd**: track_id; flags = `default_base_is_moof`; `sample_description_index` set if != 1
-  - **tfdt**: base_media_decode_time in canonical media timescale; version 0 if fits in u32, else version 1
-  - **trun**: flags = `data_offset | sample_duration | sample_size | sample_flags`; add `sample_cts` flag if any sample has a non-zero composition time offset
+  - **tfhd**: track_id; flags = `default_base_is_moof`; no default sample values (all explicit in trun)
+  - **tfdt**: base_media_decode_time in the track's media timescale
+  - **trun**: exactly one entry; flags = `data_offset | sample_duration | sample_size | sample_flags`; add `sample_cts` flag if the sample has a non-zero composition time offset
 
 ### trun Sample Flags
 
@@ -39,7 +41,7 @@ Each moof covers exactly one track for one GoP.
 
 ### mdat
 
-Samples written sequentially in decode order within the mdat. One mdat per track per segment.
+One mdat per moof, containing exactly one sample's data.
 
 ## MUXL Archive fMP4
 
@@ -73,6 +75,8 @@ Codec-agnostic. Players use stsd entries for codec detection.
 
 The moov in the init segment describes track configuration with empty sample tables. It uses the same canonical field values as the flat MP4 moov, but with zero durations and no sample entries.
 
+Required child boxes: `mvhd`, `trak` (one per track), `mvex` (with `trex` per track).
+
 ### mvhd
 
 - **version**: 0
@@ -85,6 +89,19 @@ The moov in the init segment describes track configuration with empty sample tab
 - **volume**: 1.0
 - **matrix**: identity
 - **next_track_id**: max(track_ids) + 1
+
+### mvex
+
+Required for fMP4 playback — signals that moof+mdat pairs follow the moov.
+
+- **trex** (one per track):
+  - **track_id**: matching the trak
+  - **default_sample_description_index**: 1
+  - **default_sample_duration**: 0
+  - **default_sample_size**: 0
+  - **default_sample_flags**: 0
+
+All sample metadata is explicit in each trun entry, so trex defaults are all zero.
 
 ### trak ordering
 
@@ -105,14 +122,9 @@ Sorted by track_id ascending. No udta, meta, or iods.
 - **flags**: 0
 - **creation_time**: 0
 - **modification_time**: 0
-- **timescale**: canonical value per track type
+- **timescale**: preserved from source track (passthrough)
 - **duration**: 0 (init segment) or recomputed (flat MP4)
-- **language**: from track config
-
-Canonical media timescales:
-
-- **Video**: 60000
-- **Audio**: 48000
+- **language**: `"und"`
 
 ### hdlr
 
@@ -121,6 +133,13 @@ Canonical media timescales:
 - **handler_type**: from track config
 - **name**: `"VideoHandler"` / `"SoundHandler"` / `"SubtitleHandler"` / empty
 
+### minf
+
+- **vmhd**: present for video tracks (default values)
+- **smhd**: present for audio tracks (default values)
+- **dinf**: required, contains dref
+  - **dref**: one self-contained `url` entry with empty location string (signals data is in the same file)
+
 ### stbl (Sample Table)
 
 In init segment: stsd populated with codec config, all other tables empty.
@@ -128,16 +147,16 @@ In init segment: stsd populated with codec config, all other tables empty.
 In flat MP4:
 
 - **stsd**: codec configuration from track config
-- **stts**: from trun sample durations (rescaled to canonical timescale)
+- **stts**: from trun sample durations
 - **stss**: derived from trun sample flags (sync samples)
-- **ctts**: from trun composition time offsets (rescaled to canonical timescale)
+- **ctts**: from trun composition time offsets
 - **stsz**: from trun sample sizes
 - **stsc**: one sample per chunk, entries track sample_description_index changes
 - **stco/co64**: recomputed from mdat layout; stco if all offsets fit in u32
 
 ### edts / elst
 
-From track config. segment_duration in movie timescale (1000). media_time in canonical media timescale.
+From track config. segment_duration in movie timescale (1000). media_time in the track's media timescale.
 
 ## Stripped Boxes
 

@@ -35,6 +35,7 @@ moof(track 3) + mdat(track 3)      ← additional tracks
 ```
 
 Key properties:
+
 - **Per-track moof+mdat pairs**: each track is independently hashable without parsing
 - **Blindly concatenatable**: multiple segments can be appended by simple byte concatenation
 - **Init data is out-of-band**: track initialization metadata (codec config, timescales) is not part of the segment; it comes from the archive file header or an external source (e.g., S2PA manifest)
@@ -117,6 +118,7 @@ encoder → frames → MoQ transport (Hang CMAF, per-frame)
 ```
 
 Key properties:
+
 - **Signing is not on the hot path**: frames transmit immediately; the signer runs ~1 GoP behind
 - **Zero additional latency** for viewers who don't need real-time verification
 - **~1 GoP latency** (typically 1-2 seconds) for inline verification
@@ -134,6 +136,7 @@ GoP 1:
 ```
 
 This supports:
+
 - **Subset verification**: verify only the video track without touching audio
 - **Track independence**: drop or replace a track without invalidating the others
 - **Multi-track streams**: multiple synced video and audio tracks
@@ -143,6 +146,7 @@ This supports:
 Mobile WebRTC/WHIP sources may change resolution or orientation mid-stream (phone rotation, camera switch). This produces new H.264 SPS/PPS (or AV1 sequence headers) at keyframe boundaries.
 
 In the pipeline:
+
 1. Resolution change always aligns with a keyframe (codec requirement)
 2. Keyframe starts a new GoP → new MUXL segment
 3. New segment references updated codec parameters via the init data
