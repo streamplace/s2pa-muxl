@@ -2,6 +2,19 @@
 
 Issues that need further investigation before the canonical form is finalized.
 
+## mfhd sequence number determinism
+
+The `mfhd` sequence_number in each moof is currently globally incrementing across the stream. This means the same content produces different moof bytes depending on where it appears in a stream — a 1-hour file and a 30-minute file containing the last 30 minutes of the same stream will have identical frame data but different sequence numbers, breaking content-addressed identity.
+
+Neither ffmpeg nor GStreamer use this field during demuxing; the ISOBMFF spec says it's for "detecting loss/reordering" in streaming contexts.
+
+Options:
+1. **Zero all sequence numbers**: simplest, maximally deterministic. Risk: some proprietary decoder or player might reject or mishandle moof with sequence_number=0.
+2. **Per-segment numbering** (reset to 1 at each segment boundary): each segment is independently numbered starting at 1. Maintains monotonicity within a playback session for any given segment. Segments are identical regardless of position in the stream.
+3. **Global numbering** (current): simple, spec-compliant, but prevents content-identical segments from being byte-identical.
+
+Need to verify playback behavior of options 1 and 2 across a range of decoders (browsers, mobile players, hardware decoders, smart TVs) before committing to a choice.
+
 ## Timescale normalization
 
 Currently, media timescales are passed through from the source (e.g., 16000 for 60fps video from GStreamer, 60000 from ffmpeg). This means the same logical content from different encoders produces different timescales in the init segment and different duration values in trun entries.
