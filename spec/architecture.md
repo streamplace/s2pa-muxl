@@ -25,37 +25,35 @@ MUXL does not define this format — it is defined by the [Hang specification](h
 
 ### MUXL Segment — Canonical Byte Sequence
 
-A MUXL segment represents one GoP of content. Each track has its own moof+mdat pair. This is the canonical byte sequence that content hashes and signatures are computed over.
+A MUXL segment contains one track's per-frame moof+mdat pairs for one GoP. Each GoP produces one segment per track. This is the canonical byte sequence that content hashes and signatures are computed over.
 
 ```
-moof(track 1) + mdat(track 1)      ← video frames for this GoP
-moof(track 2) + mdat(track 2)      ← audio packets for this GoP
-moof(track 3) + mdat(track 3)      ← additional tracks
+GoP 1:
+  segment (track 1): moof+mdat, moof+mdat, ...   ← video frames
+  segment (track 2): moof+mdat, moof+mdat, ...   ← audio packets
 ```
 
 Key properties:
 
-- **Per-track moof+mdat pairs**: each track is independently hashable without parsing
-- **Blindly concatenatable**: multiple segments can be appended by simple byte concatenation
+- **Per-track segments**: each track is independently hashable, addressable, and concatenatable
+- **Byte-range addressable**: in the archive, all segments for a track are contiguous, enabling HLS byte-range playlists over a single file
+- **Blindly concatenatable**: segments for the same track can be appended by simple byte concatenation
 - **Init data is out-of-band**: track initialization metadata (codec config, timescales) is not part of the segment; it comes from the archive file header or an external source (e.g., S2PA manifest)
 - **Deterministic**: given the same source frames, any MUXL implementation produces identical segment bytes
 
-Track ordering within a segment: tracks are ordered by track_id (ascending).
-
-Segmentation rule: each segment begins at a video sync sample (keyframe). Audio samples are grouped with the video GoP they temporally overlap. This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
+Segmentation rule: segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. This rule is deterministic — given the same samples with the same timestamps, the segment boundaries are always identical.
 
 ### MUXL Archive fMP4 — Storage Format
 
-For storage, the archive prepends an init segment (ftyp + moov with empty sample tables) to concatenated MUXL segments:
+For storage, the archive prepends an init segment (ftyp + moov with empty sample tables) to per-track segments grouped by track:
 
 ```
 ftyp + moov (init, empty sample tables)
-moof+mdat + moof+mdat ...              ← GoP 1 (per-track pairs)
-moof+mdat + moof+mdat ...              ← GoP 2
-...
+[track 1 segments: GoP 1, GoP 2, ...]   ← e.g., all video
+[track 2 segments: GoP 1, GoP 2, ...]   ← e.g., all audio
 ```
 
-This is a valid fMP4 file — any player can open it. New GoPs are appended without modifying existing data (crash-safe, no finalization step for 24-hour livestreams).
+This is a valid fMP4 file. Each track's data is a contiguous byte range, enabling HLS byte-range playlists to reference individual tracks within the single file. Tracks are ordered by track_id ascending.
 
 The init segment is stable as long as the track configuration doesn't change. When codec parameters change (e.g., resolution switch), a new init segment is needed (see Open Questions).
 
@@ -106,13 +104,13 @@ Key properties:
 
 ### Per-Track Signing Model
 
-Each track within a GoP segment is hashed independently:
+Each per-track segment is hashed independently:
 
 ```
 GoP 1:
-  track 1 (video): moof+mdat bytes → hash_v1
-  track 2 (audio): moof+mdat bytes → hash_a1
-  track 3 (audio): moof+mdat bytes → hash_a2
+  segment (track 1, video): bytes → hash_v1
+  segment (track 2, audio): bytes → hash_a1
+  segment (track 3, audio): bytes → hash_a2
 ```
 
 This supports:

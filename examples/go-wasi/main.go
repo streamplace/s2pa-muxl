@@ -33,11 +33,12 @@ import (
 //
 // Wire format (one CBOR map per event):
 //
-//	{"type": "init", "data": <bstr>}
-//	{"type": "segment", "data": <bstr>}
+//	{"type": "init", "data": h'<ftyp+moov bytes>'}
+//	{"type": "segment", "tracks": {"1": h'<video>', "2": h'<audio>'}}
 type MuxlEvent struct {
-	Type string `cbor:"type"`
-	Data []byte `cbor:"data"`
+	Type   string            `cbor:"type"`
+	Data   []byte            `cbor:"data,omitempty"`
+	Tracks map[string][]byte `cbor:"tracks,omitempty"`
 }
 
 func main() {
@@ -68,7 +69,9 @@ func main() {
 		case "init":
 			fmt.Fprintf(os.Stderr, "init segment: %d bytes\n", len(ev.Data))
 		case "segment":
-			fmt.Fprintf(os.Stderr, "segment: %d bytes\n", len(ev.Data))
+			for trackID, data := range ev.Tracks {
+				fmt.Fprintf(os.Stderr, "segment track %s: %d bytes\n", trackID, len(data))
+			}
 		}
 	}
 }
@@ -141,8 +144,8 @@ func RunMuxlSegmenter(ctx context.Context, input io.Reader) ([]MuxlEvent, error)
 
 // ParseMuxlEvents reads CBOR (DRISL) events from the muxl --stdout stream.
 //
-// Each event is a separate CBOR value — a map with "type", "data", and
-// optionally "number" fields.
+// Each event is a separate CBOR value — a map with "type" and either "data"
+// (for init) or "tracks" (for segment) fields.
 func ParseMuxlEvents(r io.Reader) ([]MuxlEvent, error) {
 	var events []MuxlEvent
 	decoder := drisl.NewDecoder(r)

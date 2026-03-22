@@ -133,10 +133,17 @@ fn cmd_segment_dir(input: &mut impl Read, output_dir: &str) -> crate::Result<()>
     let output_dir = std::path::Path::new(output_dir);
     fs::create_dir_all(output_dir)?;
 
-    let catalog = crate::segment_fmp4(input, |seg| {
-        let filename = output_dir.join(format!("segment_{:04}.m4s", seg.number));
-        fs::write(&filename, &seg.data)?;
-        eprintln!("segment {:4}: {} bytes", seg.number, seg.data.len());
+    let catalog = crate::segment_fmp4(input, |gop| {
+        for (&track_id, data) in &gop.tracks {
+            let track_dir = output_dir.join(format!("track{}", track_id));
+            fs::create_dir_all(&track_dir)?;
+            let filename = track_dir.join(format!("segment_{:04}.m4s", gop.number));
+            fs::write(&filename, data)?;
+            eprintln!(
+                "track {} segment {:4}: {} bytes",
+                track_id, gop.number, data.len()
+            );
+        }
         Ok(())
     })?;
 
@@ -185,8 +192,14 @@ fn write_cbor_event(w: &mut impl io::Write, event: &crate::SegmenterEvent) -> cr
         crate::SegmenterEvent::InitSegment { data, .. } => {
             eprintln!("init: {} bytes", data.len());
         }
-        crate::SegmenterEvent::Segment(seg) => {
-            eprintln!("segment: {} bytes", seg.data.len());
+        crate::SegmenterEvent::Segment(gop) => {
+            let total: usize = gop.tracks.values().map(|d| d.len()).sum();
+            eprintln!(
+                "segment {}: {} tracks, {} bytes",
+                gop.number,
+                gop.tracks.len(),
+                total
+            );
         }
     }
     Ok(())
@@ -219,29 +232,46 @@ fn cmd_concat() -> crate::Result<()> {
 }
 
 fn cmd_segment_archive(input: &mut impl Read, output_path: &str) -> crate::Result<()> {
-    let mut segments: Vec<Vec<u8>> = Vec::new();
+    let mut gops = Vec::new();
 
-    let catalog = crate::segment_fmp4(input, |seg| {
-        eprintln!("segment {:4}: {} bytes", seg.number, seg.data.len());
-        segments.push(seg.data);
+    let catalog = crate::segment_fmp4(input, |gop| {
+        let total: usize = gop.tracks.values().map(|d| d.len()).sum();
+        eprintln!(
+            "segment {:4}: {} tracks, {} bytes",
+            gop.number,
+            gop.tracks.len(),
+            total
+        );
+        gops.push(gop);
         Ok(())
     })?;
 
-    // Build archive: init + all segments
-    let init = crate::build_init_segment(&catalog)?;
-    let total_size: usize = init.len() + segments.iter().map(|s| s.len()).sum::<usize>();
+    // Collect track IDs in order
+    let mut track_ids: Vec<u32> = gops
+        .iter()
+        .flat_map(|g| g.tracks.keys().copied())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    track_ids.sort();
 
-    let mut archive = Vec::with_capacity(total_size);
-    archive.extend_from_slice(&init);
-    for seg in &segments {
-        archive.extend_from_slice(seg);
+    // Build per-track archive: init + [all track1 segments] + [all track2 segments]
+    let init = crate::build_init_segment(&catalog)?;
+    let mut archive = init;
+    for &tid in &track_ids {
+        for gop in &gops {
+            if let Some(data) = gop.tracks.get(&tid) {
+                archive.extend_from_slice(data);
+            }
+        }
     }
 
     fs::write(output_path, &archive)?;
     eprintln!(
-        "archive: {} bytes ({} segments)",
+        "archive: {} bytes ({} GOPs, {} tracks)",
         archive.len(),
-        segments.len()
+        gops.len(),
+        track_ids.len()
     );
 
     Ok(())

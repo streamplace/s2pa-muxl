@@ -1,38 +1,51 @@
-//! MUXL segmentation: fMP4 → GOP-aligned MUXL segments.
+//! MUXL segmentation: fMP4 → per-track, GOP-aligned MUXL segments.
 //!
-//! A MUXL segment is a concatenation of per-frame moof+mdat pairs covering
-//! one video GOP (keyframe to keyframe). Audio frames for the same time range
-//! are included in the same segment.
+//! Each MUXL segment contains one track's moof+mdat pairs for one video GOP.
+//! Segments are emitted per-track at each keyframe boundary, ordered by
+//! track_id ascending. This enables per-track byte-range addressing in
+//! MUXL archive files (for HLS playlists) and per-track content hashing.
 //!
 //! Spec: architecture.md § MUXL Segment
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::fragment::FMP4Reader;
 
-/// A GOP-aligned MUXL segment.
+/// A per-track, GOP-aligned MUXL segment.
 pub struct Segment {
-    /// Segment number (1-based).
+    /// GOP number (1-based). All tracks for the same GOP share the same number.
     pub number: u32,
-    /// Concatenated moof+mdat pairs for all frames in this GOP.
+    /// Track ID this segment belongs to.
+    pub track_id: u32,
+    /// Concatenated moof+mdat pairs for this track in this GOP.
     pub data: Vec<u8>,
 }
 
-/// Segment an fMP4 stream into GOP-aligned MUXL segments.
+/// A bundled multi-track GOP segment for streaming events.
+#[derive(Debug, PartialEq)]
 ///
-/// Only requires `Read` — no seeking. Splits at video keyframe boundaries:
-/// a new segment starts when a sync (key) frame arrives on any video track,
-/// after the first one.
+/// Contains all tracks' data for one GOP. Track data is keyed by track_id.
+/// Used in [`crate::push::SegmenterEvent`] so consumers receive a complete
+/// GOP in a single event.
+pub struct GopSegment {
+    /// GOP number (1-based).
+    pub number: u32,
+    /// Per-track moof+mdat data, keyed by track_id (ordered ascending).
+    pub tracks: BTreeMap<u32, Vec<u8>>,
+}
+
+/// Segment an fMP4 stream into per-track, GOP-aligned MUXL segments.
 ///
-/// Calls `on_segment` for each completed segment. Returns the catalog
-/// extracted from the init segment. Use `build_init_segment(&catalog)` to
-/// produce the canonical init segment bytes.
+/// Only requires `Read` — no seeking. Splits at video keyframe boundaries.
+/// Each GOP emits a [`GopSegment`] containing all tracks' data.
+///
+/// Calls `on_gop` for each completed GOP segment. Returns the catalog.
 pub fn segment_fmp4<R: Read>(
     reader: &mut R,
-    mut on_segment: impl FnMut(Segment) -> Result<()>,
+    mut on_gop: impl FnMut(GopSegment) -> Result<()>,
 ) -> Result<Catalog> {
     let mut fmp4 = FMP4Reader::new(reader)?;
     let catalog = fmp4.catalog().clone();
@@ -40,7 +53,8 @@ pub fn segment_fmp4<R: Read>(
     // Determine which track IDs are video (for keyframe detection)
     let video_track_ids: HashSet<u32> = catalog.video.values().map(|v| v.track_id).collect();
 
-    let mut segment_buf: Vec<u8> = Vec::new();
+    // Per-track buffers, ordered by track_id
+    let mut track_bufs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut segment_number: u32 = 0;
     let mut seen_first_keyframe = false;
 
@@ -48,31 +62,52 @@ pub fn segment_fmp4<R: Read>(
         let is_video_keyframe = video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
         if is_video_keyframe && seen_first_keyframe {
-            // Flush the current segment
             segment_number += 1;
-            on_segment(Segment {
-                number: segment_number,
-                data: std::mem::take(&mut segment_buf),
-            })?;
+            if let Some(gop) = flush_track_bufs(&mut track_bufs, segment_number) {
+                on_gop(gop)?;
+            }
         }
 
         if is_video_keyframe {
             seen_first_keyframe = true;
         }
 
-        segment_buf.extend_from_slice(&frame.data);
+        track_bufs
+            .entry(frame.track_id)
+            .or_default()
+            .extend_from_slice(&frame.data);
     }
 
-    // Flush the final segment (if any data remains)
-    if !segment_buf.is_empty() {
-        segment_number += 1;
-        on_segment(Segment {
-            number: segment_number,
-            data: segment_buf,
-        })?;
+    // Flush remaining data
+    segment_number += 1;
+    if let Some(gop) = flush_track_bufs(&mut track_bufs, segment_number) {
+        on_gop(gop)?;
     }
 
     Ok(catalog)
+}
+
+/// Flush all non-empty per-track buffers into a [`GopSegment`].
+///
+/// Returns `None` if all buffers are empty.
+pub(crate) fn flush_track_bufs(
+    track_bufs: &mut BTreeMap<u32, Vec<u8>>,
+    segment_number: u32,
+) -> Option<GopSegment> {
+    let mut tracks = BTreeMap::new();
+    for (&track_id, buf) in track_bufs.iter_mut() {
+        if !buf.is_empty() {
+            tracks.insert(track_id, std::mem::take(buf));
+        }
+    }
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(GopSegment {
+            number: segment_number,
+            tracks,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -89,37 +124,44 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_fmp4_produces_segments() {
+    fn test_segment_fmp4_produces_bundled_gop_segments() {
         let data = read_fixture("h264-opus-frag.mp4");
-        let mut segments = Vec::new();
-        let catalog = segment_fmp4(&mut Cursor::new(&data), |seg| {
-            segments.push(seg);
+        let mut gops = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
             Ok(())
         })
         .unwrap();
 
-        assert!(!catalog.video.is_empty(), "should have video tracks");
-        assert!(!segments.is_empty(), "should produce at least one segment");
+        let num_tracks = catalog.video.len() + catalog.audio.len();
+        assert!(num_tracks > 1, "fixture should have multiple tracks");
+        assert!(!gops.is_empty(), "should produce GOP segments");
 
-        // Segments should be numbered sequentially
-        for (i, seg) in segments.iter().enumerate() {
-            assert_eq!(seg.number, (i + 1) as u32);
-            assert!(
-                !seg.data.is_empty(),
-                "segment {} should have data",
-                seg.number
+        // Each GOP should bundle all tracks
+        for (i, gop) in gops.iter().enumerate() {
+            assert_eq!(gop.number, (i + 1) as u32);
+            assert_eq!(
+                gop.tracks.len(),
+                num_tracks,
+                "GOP {} should have all tracks",
+                gop.number
             );
+            // Track IDs should be sorted ascending (BTreeMap guarantees this)
+            let track_ids: Vec<u32> = gop.tracks.keys().copied().collect();
+            let mut sorted = track_ids.clone();
+            sorted.sort();
+            assert_eq!(track_ids, sorted);
         }
     }
 
     #[test]
     fn test_segment_data_is_all_frame_data() {
-        // Total bytes across all segments should equal total bytes across all frames
+        // Total bytes across all per-track segments should equal total frame bytes
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segment_total = 0usize;
-        segment_fmp4(&mut Cursor::new(&data), |seg| {
-            segment_total += seg.data.len();
+        segment_fmp4(&mut Cursor::new(&data), |gop| {
+            segment_total += gop.tracks.values().map(|d| d.len()).sum::<usize>();
             Ok(())
         })
         .unwrap();
@@ -138,92 +180,113 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_equals_init_plus_segments() {
+    fn test_per_track_archive_is_parseable() {
         let data = read_fixture("h264-opus-frag.mp4");
 
-        let mut segments = Vec::new();
-        let catalog = segment_fmp4(&mut Cursor::new(&data), |seg| {
-            segments.push(seg);
+        let mut gops = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
             Ok(())
         })
         .unwrap();
 
         let init = build_init_segment(&catalog).unwrap();
 
-        // Build archive: init + all segments concatenated
-        let mut archive = init.clone();
-        for seg in &segments {
-            archive.extend_from_slice(&seg.data);
+        // Build per-track archive
+        let mut track_ids: Vec<u32> = gops
+            .iter()
+            .flat_map(|g| g.tracks.keys().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        track_ids.sort();
+
+        let mut archive = init;
+        for &tid in &track_ids {
+            for gop in &gops {
+                if let Some(data) = gop.tracks.get(&tid) {
+                    archive.extend_from_slice(data);
+                }
+            }
         }
 
-        // The archive should be parseable as fMP4
         let archive_catalog = crate::catalog_from_mp4(Cursor::new(&archive)).unwrap();
         assert_eq!(catalog.video.len(), archive_catalog.video.len());
         assert_eq!(catalog.audio.len(), archive_catalog.audio.len());
-
-        // And re-segmenting the archive should produce the same number of segments
-        let mut re_segments = Vec::new();
-        segment_fmp4(&mut Cursor::new(&archive), |seg| {
-            re_segments.push(seg);
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(
-            segments.len(),
-            re_segments.len(),
-            "re-segmenting archive should produce same segment count"
-        );
     }
 
     #[test]
-    fn test_segments_start_with_keyframe() {
-        // Each segment's first video frame should be a sync frame.
-        // We can verify by re-fragmenting each segment and checking.
+    fn test_video_segments_start_with_keyframe() {
         let data = read_fixture("h264-opus-frag.mp4");
 
-        let mut segments = Vec::new();
-        let catalog = segment_fmp4(&mut Cursor::new(&data), |seg| {
-            segments.push(seg);
+        let mut gops = Vec::new();
+        let catalog = segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
             Ok(())
         })
         .unwrap();
 
         let video_track_ids: HashSet<u32> = catalog.video.values().map(|v| v.track_id).collect();
 
-        for seg in &segments {
-            // Parse the segment's moof+mdat pairs to find the first video frame
-            use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
+        for gop in &gops {
+            for (&track_id, track_data) in &gop.tracks {
+                if !video_track_ids.contains(&track_id) {
+                    continue;
+                }
+                use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
 
-            let mut cursor = Cursor::new(&seg.data);
-            let mut found_video = false;
+                let mut cursor = Cursor::new(track_data);
+                let h = <Option<Header> as ReadFrom>::read_from(&mut cursor)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(h.kind, Moof::KIND);
+                let moof = Moof::read_atom(&h, &mut cursor).unwrap();
+                let entry = &moof.traf[0].trun[0].entries[0];
+                let flags = entry.flags.unwrap_or(0);
+                let is_sync = (flags & 0x00010000) == 0;
+                assert!(
+                    is_sync,
+                    "video segment (GOP {}, track {}) first frame should be sync",
+                    gop.number, track_id
+                );
+            }
+        }
+    }
 
-            while cursor.position() < seg.data.len() as u64 {
-                let h = match <Option<Header> as ReadFrom>::read_from(&mut cursor) {
-                    Ok(Some(h)) => h,
-                    _ => break,
-                };
+    #[test]
+    fn test_each_track_data_has_single_track() {
+        let data = read_fixture("h264-opus-frag.mp4");
 
-                if h.kind == Moof::KIND {
-                    let moof = Moof::read_atom(&h, &mut cursor).unwrap();
-                    for traf in &moof.traf {
-                        if video_track_ids.contains(&traf.tfhd.track_id) && !found_video {
-                            // First video frame in this segment — check sync flag
-                            let entry = &traf.trun[0].entries[0];
-                            let flags = entry.flags.unwrap_or(0);
-                            let is_sync = (flags & 0x00010000) == 0;
-                            assert!(
-                                is_sync,
-                                "segment {} first video frame should be sync",
-                                seg.number
+        let mut gops = Vec::new();
+        segment_fmp4(&mut Cursor::new(&data), |gop| {
+            gops.push(gop);
+            Ok(())
+        })
+        .unwrap();
+
+        for gop in &gops {
+            for (&track_id, track_data) in &gop.tracks {
+                use mp4_atom::{Atom, Header, Moof, ReadAtom, ReadFrom};
+
+                let mut cursor = Cursor::new(track_data);
+                while cursor.position() < track_data.len() as u64 {
+                    let h = match <Option<Header> as ReadFrom>::read_from(&mut cursor) {
+                        Ok(Some(h)) => h,
+                        _ => break,
+                    };
+                    if h.kind == Moof::KIND {
+                        let moof = Moof::read_atom(&h, &mut cursor).unwrap();
+                        for traf in &moof.traf {
+                            assert_eq!(
+                                traf.tfhd.track_id, track_id,
+                                "GOP {} track {} data contains data for track {}",
+                                gop.number, track_id, traf.tfhd.track_id
                             );
-                            found_video = true;
                         }
+                    } else {
+                        let size = h.size.unwrap_or(0);
+                        cursor.set_position(cursor.position() + size as u64);
                     }
-                } else {
-                    // Skip mdat
-                    let size = h.size.unwrap_or(0);
-                    cursor.set_position(cursor.position() + size as u64);
                 }
             }
         }

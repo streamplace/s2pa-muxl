@@ -1,16 +1,23 @@
 //! CBOR (DRISL) serialization for MUXL streaming events.
 //!
 //! Defines the wire format for the `--stdout` streaming protocol.
-//! Each event is a CBOR map written as a separate value in the stream.
+//! Each event is a separate CBOR value in the stream.
 //!
 //! ```cbor
 //! {"type": "init", "data": h'<ftyp+moov bytes>'}
-//! {"type": "segment", "data": h'<moof+mdat bytes>'}
+//! {"type": "segment", "tracks": {"1": h'<video moof+mdat>', "2": h'<audio moof+mdat>'}}
 //! ```
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::push::SegmenterEvent;
+
+/// Wrapper for `Vec<u8>` that serializes as a CBOR byte string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ByteString(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
 /// A MUXL streaming event in CBOR-serializable form.
 #[derive(Serialize, Deserialize, Debug)]
@@ -22,11 +29,13 @@ pub enum CborEvent {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    /// A GOP-aligned MUXL segment.
+    /// A complete GOP segment with all tracks bundled.
+    ///
+    /// Track keys are stringified track IDs (DRISL requires string map keys).
+    /// Values are CBOR byte strings containing per-track moof+mdat data.
     #[serde(rename = "segment")]
     Segment {
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
+        tracks: BTreeMap<String, ByteString>,
     },
 }
 
@@ -35,8 +44,12 @@ impl CborEvent {
     pub fn from_event(event: &SegmenterEvent) -> Self {
         match event {
             SegmenterEvent::InitSegment { data, .. } => CborEvent::Init { data: data.clone() },
-            SegmenterEvent::Segment(seg) => CborEvent::Segment {
-                data: seg.data.clone(),
+            SegmenterEvent::Segment(gop) => CborEvent::Segment {
+                tracks: gop
+                    .tracks
+                    .iter()
+                    .map(|(tid, data)| (tid.to_string(), ByteString(data.clone())))
+                    .collect(),
             },
         }
     }
@@ -45,7 +58,13 @@ impl CborEvent {
     pub fn from_event_owned(event: SegmenterEvent) -> Self {
         match event {
             SegmenterEvent::InitSegment { data, .. } => CborEvent::Init { data },
-            SegmenterEvent::Segment(seg) => CborEvent::Segment { data: seg.data },
+            SegmenterEvent::Segment(gop) => CborEvent::Segment {
+                tracks: gop
+                    .tracks
+                    .into_iter()
+                    .map(|(tid, data)| (tid.to_string(), ByteString(data)))
+                    .collect(),
+            },
         }
     }
 }

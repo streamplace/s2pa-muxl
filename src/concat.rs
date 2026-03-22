@@ -25,7 +25,7 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 
 use mp4_atom::{Header, Moof, Moov, ReadAtom, ReadFrom};
@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 use crate::fragment::{self, Frame};
 use crate::init::{build_init_segment, catalog_from_moov};
 use crate::push::SegmenterEvent;
-use crate::segment::Segment;
+use crate::segment::GopSegment;
 
 /// Push-based concatenator for merging multiple MUXL archives.
 ///
@@ -51,7 +51,8 @@ pub struct Concatenator {
     /// UUID atom seen during init phase, before moov has arrived.
     pending_uuid: Option<Vec<u8>>,
     state: ConcatState,
-    segment_buf: Vec<u8>,
+    /// Per-track segment buffers, ordered by track_id.
+    track_bufs: BTreeMap<u32, Vec<u8>>,
     segment_number: u32,
 }
 
@@ -84,7 +85,7 @@ impl Concatenator {
             current_uuid: None,
             pending_uuid: None,
             state: ConcatState::WaitingForInit,
-            segment_buf: Vec::new(),
+            track_bufs: BTreeMap::new(),
             segment_number: 0,
         }
     }
@@ -237,7 +238,10 @@ impl Concatenator {
                             ss.seen_first_keyframe = true;
                         }
 
-                        self.segment_buf.extend_from_slice(&frame.data);
+                        self.track_bufs
+                            .entry(frame.track_id)
+                            .or_default()
+                            .extend_from_slice(&frame.data);
                     }
                 }
                 _ => {
@@ -257,19 +261,28 @@ impl Concatenator {
     }
 
     fn flush_segment_into(&mut self, events: &mut Vec<SegmenterEvent>) {
-        if self.segment_buf.is_empty() {
+        if !self.track_bufs.values().any(|b| !b.is_empty()) {
             return;
         }
         self.segment_number += 1;
-        let mut data = Vec::new();
-        if let Some(uuid) = &self.current_uuid {
-            data.extend_from_slice(uuid);
+        let uuid = self.current_uuid.clone();
+        let mut tracks = BTreeMap::new();
+        for (&track_id, buf) in self.track_bufs.iter_mut() {
+            if !buf.is_empty() {
+                let mut data = Vec::new();
+                if let Some(ref uuid) = uuid {
+                    data.extend_from_slice(uuid);
+                }
+                data.append(buf);
+                tracks.insert(track_id, data);
+            }
         }
-        data.append(&mut self.segment_buf);
-        events.push(SegmenterEvent::Segment(Segment {
-            number: self.segment_number,
-            data,
-        }));
+        if !tracks.is_empty() {
+            events.push(SegmenterEvent::Segment(GopSegment {
+                number: self.segment_number,
+                tracks,
+            }));
+        }
     }
 }
 
@@ -331,42 +344,43 @@ mod tests {
     /// Build a test archive in the Streamplace layout: ftyp + uuid + moov + moof+mdat...
     /// Uses the existing Segmenter to get canonical init + segment data from the fixture,
     /// then reassembles with the UUID atom inserted between ftyp and moov.
+    /// Returns (archive bytes, original GopSegments).
     fn build_streamplace_archive(
         fixture: &[u8],
         uuid_atom: &[u8],
-    ) -> (Vec<u8>, Vec<Vec<u8>>) {
+    ) -> (Vec<u8>, Vec<GopSegment>) {
         let mut segmenter = crate::push::Segmenter::new();
         let mut seg_events = segmenter.feed(fixture).unwrap();
         seg_events.extend(segmenter.flush().unwrap());
 
         let mut archive = Vec::new();
-        let mut original_segments = Vec::new();
+        let mut original_gops = Vec::new();
 
-        for event in &seg_events {
+        for event in seg_events {
             match event {
                 SegmenterEvent::InitSegment { data, .. } => {
-                    // The canonical init is ftyp+moov. We need to split them
-                    // and insert the UUID between them.
-                    let (ftyp_size, _) = peek_atom_header(data).unwrap();
+                    let (ftyp_size, _) = peek_atom_header(&data).unwrap();
                     let ftyp = &data[..ftyp_size];
                     let moov = &data[ftyp_size..];
                     archive.extend_from_slice(ftyp);
                     archive.extend_from_slice(uuid_atom);
                     archive.extend_from_slice(moov);
                 }
-                SegmenterEvent::Segment(seg) => {
-                    original_segments.push(seg.data.clone());
-                    archive.extend_from_slice(&seg.data);
+                SegmenterEvent::Segment(gop) => {
+                    // Write interleaved for the archive input
+                    for data in gop.tracks.values() {
+                        archive.extend_from_slice(data);
+                    }
+                    original_gops.push(gop);
                 }
             }
         }
 
-        (archive, original_segments)
+        (archive, original_gops)
     }
 
     #[test]
     fn test_concat_single_archive_no_uuid() {
-        // Without UUID, segments should still work (no uuid prefix in output)
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = crate::push::Segmenter::new();
@@ -374,13 +388,15 @@ mod tests {
         seg_events.extend(segmenter.flush().unwrap());
 
         let mut archive = Vec::new();
-        let mut original_segments = Vec::new();
-        for event in &seg_events {
+        let mut original_gops = Vec::new();
+        for event in seg_events {
             match event {
-                SegmenterEvent::InitSegment { data, .. } => archive.extend_from_slice(data),
-                SegmenterEvent::Segment(seg) => {
-                    original_segments.push(seg.data.clone());
-                    archive.extend_from_slice(&seg.data);
+                SegmenterEvent::InitSegment { data, .. } => archive.extend_from_slice(&data),
+                SegmenterEvent::Segment(gop) => {
+                    for data in gop.tracks.values() {
+                        archive.extend_from_slice(data);
+                    }
+                    original_gops.push(gop);
                 }
             }
         }
@@ -395,7 +411,7 @@ mod tests {
             .count();
         assert_eq!(init_count, 1);
 
-        let segments: Vec<&Segment> = events
+        let gops: Vec<&GopSegment> = events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
@@ -403,26 +419,25 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(segments.len(), original_segments.len());
-        for (concat_seg, orig_data) in segments.iter().zip(original_segments.iter()) {
-            assert_eq!(&concat_seg.data, orig_data, "segment data should match without UUID");
+        assert_eq!(gops.len(), original_gops.len());
+        for (concat_gop, orig_gop) in gops.iter().zip(original_gops.iter()) {
+            assert_eq!(concat_gop.tracks, orig_gop.tracks, "GOP {} tracks should match", concat_gop.number);
         }
     }
 
     #[test]
     fn test_concat_uuid_prepended_to_segments() {
-        // UUID from init section should be prepended to each output segment
         let data = read_fixture("h264-opus-frag.mp4");
         let test_uuid: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let uuid_atom = make_uuid_atom(&test_uuid, b"s2pa-payload");
 
-        let (archive, original_segments) = build_streamplace_archive(&data, &uuid_atom);
+        let (archive, original_gops) = build_streamplace_archive(&data, &uuid_atom);
 
         let mut concat = Concatenator::new();
         let mut events = concat.feed(&archive).unwrap();
         events.extend(concat.flush().unwrap());
 
-        let segments: Vec<&Segment> = events
+        let gops: Vec<&GopSegment> = events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
@@ -430,27 +445,28 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(segments.len(), original_segments.len());
-        for (i, (concat_seg, orig_data)) in
-            segments.iter().zip(original_segments.iter()).enumerate()
-        {
-            assert!(
-                concat_seg.data.starts_with(&uuid_atom),
-                "segment {} should start with UUID atom",
-                i + 1
-            );
-            assert_eq!(
-                &concat_seg.data[uuid_atom.len()..],
-                orig_data.as_slice(),
-                "segment {} moof+mdat data should match after UUID prefix",
-                i + 1
-            );
+        assert_eq!(gops.len(), original_gops.len());
+        for (concat_gop, orig_gop) in gops.iter().zip(original_gops.iter()) {
+            // Each track's data should be uuid_atom + original data
+            for (tid, concat_data) in &concat_gop.tracks {
+                let orig_data = orig_gop.tracks.get(tid).expect("missing track");
+                assert!(
+                    concat_data.starts_with(&uuid_atom),
+                    "GOP {} track {} should start with UUID atom",
+                    concat_gop.number, tid
+                );
+                assert_eq!(
+                    &concat_data[uuid_atom.len()..],
+                    orig_data.as_slice(),
+                    "GOP {} track {} data should match after UUID",
+                    concat_gop.number, tid
+                );
+            }
         }
     }
 
     #[test]
     fn test_concat_duplicate_archive_single_init() {
-        // Concatenating the same archive twice should emit init only once
         let data = read_fixture("h264-opus-frag.mp4");
         let test_uuid: [u8; 16] = [0x01; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, &[]);
@@ -470,38 +486,37 @@ mod tests {
             .count();
         assert_eq!(init_count, 1, "identical archives should emit init only once");
 
-        // All segments should have the UUID prefix
-        let segments: Vec<&Segment> = events
+        // All tracks in all GOPs should have the UUID prefix
+        let gops: Vec<&GopSegment> = events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
                 _ => None,
             })
             .collect();
-        for seg in &segments {
-            assert!(
-                seg.data.starts_with(&uuid_atom),
-                "segment {} should have UUID prefix",
-                seg.number
-            );
+        for gop in &gops {
+            for (tid, data) in &gop.tracks {
+                assert!(
+                    data.starts_with(&uuid_atom),
+                    "GOP {} track {} should have UUID prefix",
+                    gop.number, tid
+                );
+            }
         }
     }
 
     #[test]
     fn test_concat_byte_at_a_time() {
-        // Stress test: feed one byte at a time
         let data = read_fixture("h264-opus-frag.mp4");
         let test_uuid: [u8; 16] = [0xAB; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, b"test");
 
         let (archive, _) = build_streamplace_archive(&data, &uuid_atom);
 
-        // Feed whole archive at once for reference
         let mut concat_whole = Concatenator::new();
         let mut whole_events = concat_whole.feed(&archive).unwrap();
         whole_events.extend(concat_whole.flush().unwrap());
 
-        // Feed byte at a time
         let mut concat_byte = Concatenator::new();
         let mut byte_events = Vec::new();
         for b in &archive {
@@ -509,14 +524,14 @@ mod tests {
         }
         byte_events.extend(concat_byte.flush().unwrap());
 
-        let whole_segs: Vec<&Segment> = whole_events
+        let whole_gops: Vec<&GopSegment> = whole_events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
                 _ => None,
             })
             .collect();
-        let byte_segs: Vec<&Segment> = byte_events
+        let byte_gops: Vec<&GopSegment> = byte_events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
@@ -524,27 +539,25 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(whole_segs.len(), byte_segs.len());
-        for (w, b) in whole_segs.iter().zip(byte_segs.iter()) {
-            assert_eq!(w.data, b.data, "segment {} mismatch", w.number);
+        assert_eq!(whole_gops.len(), byte_gops.len());
+        for (w, b) in whole_gops.iter().zip(byte_gops.iter()) {
+            assert_eq!(w.tracks, b.tracks, "GOP {} mismatch", w.number);
         }
     }
 
     #[test]
     fn test_concat_segments_match_segmenter() {
-        // The moof+mdat content (after UUID prefix) should exactly match
-        // what the Segmenter produces
         let data = read_fixture("h264-opus-frag.mp4");
         let test_uuid: [u8; 16] = [0x42; 16];
         let uuid_atom = make_uuid_atom(&test_uuid, &[]);
 
-        let (archive, original_segments) = build_streamplace_archive(&data, &uuid_atom);
+        let (archive, original_gops) = build_streamplace_archive(&data, &uuid_atom);
 
         let mut concat = Concatenator::new();
         let mut events = concat.feed(&archive).unwrap();
         events.extend(concat.flush().unwrap());
 
-        let concat_segments: Vec<&Segment> = events
+        let concat_gops: Vec<&GopSegment> = events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
@@ -552,18 +565,18 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(concat_segments.len(), original_segments.len());
-        for (i, (cs, orig)) in concat_segments
-            .iter()
-            .zip(original_segments.iter())
-            .enumerate()
-        {
-            let after_uuid = &cs.data[uuid_atom.len()..];
-            assert_eq!(
-                after_uuid, orig.as_slice(),
-                "segment {} content mismatch",
-                i + 1
-            );
+        assert_eq!(concat_gops.len(), original_gops.len());
+        for (concat_gop, orig_gop) in concat_gops.iter().zip(original_gops.iter()) {
+            for (tid, concat_data) in &concat_gop.tracks {
+                let orig_data = orig_gop.tracks.get(tid).expect("missing track");
+                let after_uuid = &concat_data[uuid_atom.len()..];
+                assert_eq!(
+                    after_uuid,
+                    orig_data.as_slice(),
+                    "GOP {} track {} content mismatch",
+                    concat_gop.number, tid
+                );
+            }
         }
     }
 }

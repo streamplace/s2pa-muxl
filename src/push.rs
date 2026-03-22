@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 
 use mp4_atom::{Header, Moof, Moov, ReadAtom, ReadFrom};
@@ -30,7 +30,7 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::{self, Frame};
 use crate::init::{build_init_segment, catalog_from_moov};
-use crate::segment::Segment;
+use crate::segment::{GopSegment, flush_track_bufs};
 
 /// Events emitted by the push-based segmenter.
 pub enum SegmenterEvent {
@@ -41,8 +41,8 @@ pub enum SegmenterEvent {
         /// Canonical ftyp+moov bytes, ready to send to a decoder.
         data: Vec<u8>,
     },
-    /// A complete MUXL segment (one GOP of interleaved per-frame moof+mdat).
-    Segment(Segment),
+    /// A complete GOP segment with all tracks' data bundled.
+    Segment(GopSegment),
 }
 
 /// Push-based fMP4 → MUXL segment streaming processor.
@@ -66,7 +66,8 @@ struct StreamingState {
     moov: Moov,
     video_track_ids: HashSet<u32>,
     track_state: HashMap<u32, (u64, u32)>,
-    segment_buf: Vec<u8>,
+    /// Per-track segment buffers, ordered by track_id.
+    track_bufs: BTreeMap<u32, Vec<u8>>,
     segment_number: u32,
     seen_first_keyframe: bool,
     /// A parsed moof waiting for its following mdat.
@@ -135,7 +136,7 @@ impl Segmenter {
                             moov,
                             video_track_ids,
                             track_state: HashMap::new(),
-                            segment_buf: Vec::new(),
+                            track_bufs: BTreeMap::new(),
                             segment_number: 0,
                             seen_first_keyframe: false,
                             pending_moof: None,
@@ -178,24 +179,28 @@ impl Segmenter {
                                 },
                             )?;
 
-                            // Accumulate into segments, splitting at video keyframes
+                            // Accumulate into per-track buffers, splitting at video keyframes
                             for frame in frames {
                                 let is_video_keyframe =
                                     ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
                                 if is_video_keyframe && ss.seen_first_keyframe {
                                     ss.segment_number += 1;
-                                    events.push(SegmenterEvent::Segment(Segment {
-                                        number: ss.segment_number,
-                                        data: std::mem::take(&mut ss.segment_buf),
-                                    }));
+                                    if let Some(gop) =
+                                        flush_track_bufs(&mut ss.track_bufs, ss.segment_number)
+                                    {
+                                        events.push(SegmenterEvent::Segment(gop));
+                                    }
                                 }
 
                                 if is_video_keyframe {
                                     ss.seen_first_keyframe = true;
                                 }
 
-                                ss.segment_buf.extend_from_slice(&frame.data);
+                                ss.track_bufs
+                                    .entry(frame.track_id)
+                                    .or_default()
+                                    .extend_from_slice(&frame.data);
                             }
                         }
                         // Orphan mdat without moof — skip
@@ -215,12 +220,9 @@ impl Segmenter {
     pub fn flush(&mut self) -> Result<Vec<SegmenterEvent>> {
         let mut events = Vec::new();
         if let State::Streaming(ss) = &mut self.state {
-            if !ss.segment_buf.is_empty() {
-                ss.segment_number += 1;
-                events.push(SegmenterEvent::Segment(Segment {
-                    number: ss.segment_number,
-                    data: std::mem::take(&mut ss.segment_buf),
-                }));
+            ss.segment_number += 1;
+            if let Some(gop) = flush_track_bufs(&mut ss.track_bufs, ss.segment_number) {
+                events.push(SegmenterEvent::Segment(gop));
             }
         }
         Ok(events)
@@ -285,119 +287,93 @@ mod tests {
         let mut all_events = segmenter.feed(&data).unwrap();
         all_events.extend(segmenter.flush().unwrap());
 
-        // Should have exactly one InitSegment event
         let init_count = all_events
             .iter()
             .filter(|e| matches!(e, SegmenterEvent::InitSegment { .. }))
             .count();
         assert_eq!(init_count, 1, "should emit exactly one init segment");
 
-        // Collect segments
-        let segments: Vec<&Segment> = all_events
+        let gops: Vec<&GopSegment> = all_events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
                 _ => None,
             })
             .collect();
-        assert!(!segments.is_empty(), "should produce at least one segment");
-
-        // Segments should be numbered sequentially
-        for (i, seg) in segments.iter().enumerate() {
-            assert_eq!(seg.number, (i + 1) as u32);
-            assert!(!seg.data.is_empty());
-        }
+        assert!(!gops.is_empty(), "should produce at least one GOP");
 
         // Compare with pull-based segmenter
-        let mut pull_segments = Vec::new();
-        crate::segment::segment_fmp4(&mut Cursor::new(&data), |seg| {
-            pull_segments.push(seg);
+        let mut pull_gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            pull_gops.push(gop);
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(
-            segments.len(),
-            pull_segments.len(),
-            "push and pull should produce same number of segments"
-        );
-
-        for (push_seg, pull_seg) in segments.iter().zip(pull_segments.iter()) {
-            assert_eq!(push_seg.number, pull_seg.number);
-            assert_eq!(
-                push_seg.data, pull_seg.data,
-                "segment {} data should match between push and pull",
-                push_seg.number
-            );
+        assert_eq!(gops.len(), pull_gops.len(), "push and pull should produce same GOP count");
+        for (push_gop, pull_gop) in gops.iter().zip(pull_gops.iter()) {
+            assert_eq!(push_gop.number, pull_gop.number);
+            assert_eq!(push_gop.tracks.len(), pull_gop.tracks.len());
+            for (tid, push_data) in &push_gop.tracks {
+                let pull_data = pull_gop.tracks.get(tid).expect("track missing in pull");
+                assert_eq!(
+                    push_data, pull_data,
+                    "GOP {} track {} data mismatch",
+                    push_gop.number, tid
+                );
+            }
         }
     }
 
     #[test]
     fn test_push_segmenter_byte_at_a_time() {
-        // Feed one byte at a time — stress test for buffering
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = Segmenter::new();
         let mut all_events = Vec::new();
-
         for byte in &data {
             all_events.extend(segmenter.feed(std::slice::from_ref(byte)).unwrap());
         }
         all_events.extend(segmenter.flush().unwrap());
 
-        let init_count = all_events
-            .iter()
-            .filter(|e| matches!(e, SegmenterEvent::InitSegment { .. }))
-            .count();
-        assert_eq!(init_count, 1);
-
-        let segments: Vec<&Segment> = all_events
+        let gops: Vec<&GopSegment> = all_events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
                 _ => None,
             })
             .collect();
-        assert!(!segments.is_empty());
 
-        // Should match whole-file results
-        let mut pull_segments = Vec::new();
-        crate::segment::segment_fmp4(&mut Cursor::new(&data), |seg| {
-            pull_segments.push(seg);
+        let mut pull_gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            pull_gops.push(gop);
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(segments.len(), pull_segments.len());
-        for (push_seg, pull_seg) in segments.iter().zip(pull_segments.iter()) {
-            assert_eq!(
-                push_seg.data, pull_seg.data,
-                "segment {} mismatch in byte-at-a-time mode",
-                push_seg.number
-            );
+        assert_eq!(gops.len(), pull_gops.len());
+        for (push_gop, pull_gop) in gops.iter().zip(pull_gops.iter()) {
+            assert_eq!(push_gop.tracks, pull_gop.tracks, "GOP {} mismatch", push_gop.number);
         }
     }
 
     #[test]
     fn test_push_segmenter_random_chunks() {
-        // Feed in random-sized chunks
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = Segmenter::new();
         let mut all_events = Vec::new();
         let mut offset = 0;
         let mut chunk_size = 1;
-
         while offset < data.len() {
             let end = (offset + chunk_size).min(data.len());
             all_events.extend(segmenter.feed(&data[offset..end]).unwrap());
             offset = end;
-            // Vary chunk sizes: 1, 17, 289, 4913, ...
             chunk_size = (chunk_size * 17) % 5000 + 1;
         }
         all_events.extend(segmenter.flush().unwrap());
 
-        let segments: Vec<&Segment> = all_events
+        let gops: Vec<&GopSegment> = all_events
             .iter()
             .filter_map(|e| match e {
                 SegmenterEvent::Segment(s) => Some(s),
@@ -405,26 +381,21 @@ mod tests {
             })
             .collect();
 
-        let mut pull_segments = Vec::new();
-        crate::segment::segment_fmp4(&mut Cursor::new(&data), |seg| {
-            pull_segments.push(seg);
+        let mut pull_gops = Vec::new();
+        crate::segment::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            pull_gops.push(gop);
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(segments.len(), pull_segments.len());
-        for (push_seg, pull_seg) in segments.iter().zip(pull_segments.iter()) {
-            assert_eq!(
-                push_seg.data, pull_seg.data,
-                "segment {} mismatch in random-chunk mode",
-                push_seg.number
-            );
+        assert_eq!(gops.len(), pull_gops.len());
+        for (push_gop, pull_gop) in gops.iter().zip(pull_gops.iter()) {
+            assert_eq!(push_gop.tracks, pull_gop.tracks, "GOP {} mismatch", push_gop.number);
         }
     }
 
     #[test]
     fn test_push_init_segment_is_canonical() {
-        // The init segment from push should be identical to build_init_segment
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = Segmenter::new();
@@ -439,15 +410,11 @@ mod tests {
             .expect("should emit init segment");
 
         let canonical_init = build_init_segment(&push_catalog).unwrap();
-        assert_eq!(
-            push_init, canonical_init,
-            "push init segment should be canonical"
-        );
+        assert_eq!(push_init, canonical_init, "push init segment should be canonical");
     }
 
     #[test]
     fn test_push_total_bytes_match_pull() {
-        // Total segment bytes should be identical
         let data = read_fixture("h264-opus-frag.mp4");
 
         let mut segmenter = Segmenter::new();
@@ -457,14 +424,16 @@ mod tests {
         let push_total: usize = events
             .iter()
             .filter_map(|e| match e {
-                SegmenterEvent::Segment(s) => Some(s.data.len()),
+                SegmenterEvent::Segment(gop) => {
+                    Some(gop.tracks.values().map(|d| d.len()).sum::<usize>())
+                }
                 _ => None,
             })
             .sum();
 
         let mut pull_total = 0;
-        crate::segment::segment_fmp4(&mut Cursor::new(&data), |seg| {
-            pull_total += seg.data.len();
+        crate::segment::segment_fmp4(&mut Cursor::new(&data), |gop| {
+            pull_total += gop.tracks.values().map(|d| d.len()).sum::<usize>();
             Ok(())
         })
         .unwrap();

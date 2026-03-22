@@ -17,7 +17,7 @@ pub use fragment::{
 pub use init::{build_init_segment, catalog_from_moov, catalog_from_mp4, read_moov};
 pub use concat::Concatenator;
 pub use push::{Segmenter, SegmenterEvent};
-pub use segment::{Segment, segment_fmp4};
+pub use segment::{GopSegment, Segment, segment_fmp4};
 
 mod cli;
 pub use cli::cli_main;

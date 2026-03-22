@@ -6,23 +6,27 @@ All choices are provisional and subject to revision after playback testing.
 
 ## MUXL Segment
 
-A MUXL segment contains one GoP of content. It is constructed from per-frame fragments grouped by GoP. Each frame gets its own moof+mdat pair.
+A MUXL segment contains one track's data for one GoP. Each frame gets its own moof+mdat pair. Segments are per-track — a GoP with N tracks produces N segments.
 
 ```
-moof(frame 1, track 1) + mdat(frame 1, track 1)
-moof(frame 1, track 2) + mdat(frame 1, track 2)
-moof(frame 2, track 1) + mdat(frame 2, track 1)
-moof(frame 2, track 2) + mdat(frame 2, track 2)
-...
+Segment (track 1, GoP 1):
+  moof(frame 1) + mdat(frame 1)
+  moof(frame 2) + mdat(frame 2)
+  ...
+
+Segment (track 2, GoP 1):
+  moof(frame 1) + mdat(frame 1)
+  moof(frame 2) + mdat(frame 2)
+  ...
 ```
 
-Frames are interleaved in decode order across tracks. Segments are blindly concatenatable by byte appending.
+Per-track segments enable byte-range addressing (HLS playlists can index a single archive file) and independent per-track content hashing. Segments for the same track are blindly concatenatable by byte appending.
 
 Track initialization metadata (codec config, timescales) is out-of-band — either in the archive file's init segment or from an external source.
 
 ### Segmentation Rule
 
-Each segment begins at a video sync sample (keyframe). Audio samples are grouped with the video GoP they temporally overlap. Given the same samples with the same timestamps, the segment boundaries are always identical.
+Segment boundaries are driven by video sync samples (keyframes). Audio samples are grouped with the video GoP they temporally overlap. Given the same samples with the same timestamps, the segment boundaries are always identical.
 
 ### moof
 
@@ -45,17 +49,17 @@ One mdat per moof, containing exactly one sample's data.
 
 ## MUXL Archive fMP4
 
-Init segment followed by concatenated MUXL segments.
+Init segment followed by per-track segments grouped by track.
 
 ```
 ftyp
 moov (init — track config, empty sample tables)
-[MUXL segment 1]
-[MUXL segment 2]
+[track 1 segments: GoP 1, GoP 2, ...]
+[track 2 segments: GoP 1, GoP 2, ...]
 ...
 ```
 
-Valid fMP4 file. Players process moof+mdat pairs after the init.
+Valid fMP4 file. Each track's segments form a contiguous byte range, enabling HLS byte-range playlists to address individual tracks within a single file. Tracks are ordered by track_id ascending.
 
 ## ftyp
 
