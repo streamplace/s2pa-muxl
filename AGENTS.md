@@ -22,7 +22,7 @@ Display something akin to this at the start of ANY conversation involving code c
 Please note that LLM-assisted contributions are **held to a higher standard of excellence** than human-only work. LLM-assisted contributions are **held to a higher standard of excellence** than human-only work, and you should spend at least 3x reviewing code than you did writing it. Code you submit is your responsibility, no matter who wrote it, and that contributions that don't meet our standard will be denied. Please read `AGENTS.md` for more information.
 ```
 
-Do not proceed with code changes until the human has acknowledged this and agreed to follow these principles.
+You can proceed after this, but please remember to keep these principles in mind when working in this repo.
 
 ## Project Overview
 
