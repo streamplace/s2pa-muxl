@@ -59,7 +59,7 @@ enum ConcatState {
     /// Waiting for the moov box (skipping ftyp, capturing uuid).
     WaitingForInit,
     /// Processing moof+mdat fragment pairs.
-    Streaming(StreamingState),
+    Streaming(Box<StreamingState>),
 }
 
 struct StreamingState {
@@ -94,12 +94,7 @@ impl Concatenator {
         self.buffer.extend_from_slice(data);
         let mut events = Vec::new();
 
-        loop {
-            let (box_total_size, box_type) = match peek_atom_header(&self.buffer) {
-                Some(v) => v,
-                None => break,
-            };
-
+        while let Some((box_total_size, box_type)) = peek_atom_header(&self.buffer) {
             if self.buffer.len() < box_total_size {
                 break;
             }
@@ -162,13 +157,13 @@ impl Concatenator {
                         .map(|v| v.track_id)
                         .collect();
 
-                    self.state = ConcatState::Streaming(StreamingState {
+                    self.state = ConcatState::Streaming(Box::new(StreamingState {
                         moov,
                         video_track_ids,
                         track_state: HashMap::new(),
                         seen_first_keyframe: false,
                         pending_moof: None,
-                    });
+                    }));
                 }
                 b"moof" => {
                     if let ConcatState::Streaming(ss) = &mut self.state {
@@ -176,8 +171,7 @@ impl Concatenator {
                         let header = <Option<Header> as ReadFrom>::read_from(&mut cursor)
                             .map_err(mp4_err)?
                             .ok_or_else(|| Error::InvalidMp4("empty moof header".into()))?;
-                        let moof =
-                            Moof::read_atom(&header, &mut cursor).map_err(mp4_err)?;
+                        let moof = Moof::read_atom(&header, &mut cursor).map_err(mp4_err)?;
                         ss.pending_moof = Some(PendingMoof {
                             moof,
                             box_size: box_data.len(),
@@ -190,31 +184,33 @@ impl Concatenator {
                     // before calling flush_segment_into.
                     let mut frames: Vec<(Frame, bool)> = Vec::new();
 
-                    if let ConcatState::Streaming(ss) = &mut self.state {
-                        if let Some(pending) = ss.pending_moof.take() {
-                            let mdat_header_size =
-                                if box_data.len() > u32::MAX as usize { 16 } else { 8 };
-                            let mdat_payload = &box_data[mdat_header_size..];
+                    if let ConcatState::Streaming(ss) = &mut self.state
+                        && let Some(pending) = ss.pending_moof.take()
+                    {
+                        let mdat_header_size = if box_data.len() > u32::MAX as usize {
+                            16
+                        } else {
+                            8
+                        };
+                        let mdat_payload = &box_data[mdat_header_size..];
 
-                            let mut raw_frames: Vec<Frame> = Vec::new();
-                            fragment::process_moof_mdat(
-                                &ss.moov,
-                                &pending.moof,
-                                pending.box_size,
-                                mdat_payload,
-                                &mut ss.track_state,
-                                &mut |frame| {
-                                    raw_frames.push(frame);
-                                    Ok(())
-                                },
-                            )?;
+                        let mut raw_frames: Vec<Frame> = Vec::new();
+                        fragment::process_moof_mdat(
+                            &ss.moov,
+                            &pending.moof,
+                            pending.box_size,
+                            mdat_payload,
+                            &mut ss.track_state,
+                            &mut |frame| {
+                                raw_frames.push(frame);
+                                Ok(())
+                            },
+                        )?;
 
-                            for frame in raw_frames {
-                                let is_video_keyframe =
-                                    ss.video_track_ids.contains(&frame.track_id)
-                                        && frame.is_sync;
-                                frames.push((frame, is_video_keyframe));
-                            }
+                        for frame in raw_frames {
+                            let is_video_keyframe =
+                                ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
+                            frames.push((frame, is_video_keyframe));
                         }
                     }
 
@@ -331,10 +327,7 @@ mod tests {
     /// Build a test archive in the Streamplace layout: ftyp + uuid + moov + moof+mdat...
     /// Uses the existing Segmenter to get canonical init + segment data from the fixture,
     /// then reassembles with the UUID atom inserted between ftyp and moov.
-    fn build_streamplace_archive(
-        fixture: &[u8],
-        uuid_atom: &[u8],
-    ) -> (Vec<u8>, Vec<Vec<u8>>) {
+    fn build_streamplace_archive(fixture: &[u8], uuid_atom: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
         let mut segmenter = crate::push::Segmenter::new();
         let mut seg_events = segmenter.feed(fixture).unwrap();
         seg_events.extend(segmenter.flush().unwrap());
@@ -405,7 +398,10 @@ mod tests {
 
         assert_eq!(segments.len(), original_segments.len());
         for (concat_seg, orig_data) in segments.iter().zip(original_segments.iter()) {
-            assert_eq!(&concat_seg.data, orig_data, "segment data should match without UUID");
+            assert_eq!(
+                &concat_seg.data, orig_data,
+                "segment data should match without UUID"
+            );
         }
     }
 
@@ -468,7 +464,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, SegmenterEvent::InitSegment { .. }))
             .count();
-        assert_eq!(init_count, 1, "identical archives should emit init only once");
+        assert_eq!(
+            init_count, 1,
+            "identical archives should emit init only once"
+        );
 
         // All segments should have the UUID prefix
         let segments: Vec<&Segment> = events
@@ -560,7 +559,8 @@ mod tests {
         {
             let after_uuid = &cs.data[uuid_atom.len()..];
             assert_eq!(
-                after_uuid, orig.as_slice(),
+                after_uuid,
+                orig.as_slice(),
                 "segment {} content mismatch",
                 i + 1
             );

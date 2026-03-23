@@ -1,5 +1,26 @@
 # muxl — deterministic MP4 canonicalization
 
+# Point git at the tracked hooks directory (run once after cloning)
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Git hooks installed from .githooks/"
+
+# First-time dev setup: install tools and hooks
+setup: install-nextest install-hooks
+
+# Install cargo-nextest (uses binstall if available, falls back to cargo install)
+install-nextest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if cargo nextest --version &>/dev/null 2>&1; then
+        echo "cargo-nextest already installed: $(cargo nextest --version)"
+    elif cargo binstall --version &>/dev/null 2>&1; then
+        cargo binstall --no-confirm cargo-nextest
+    else
+        cargo install --locked cargo-nextest
+    fi
+
+
 # Default: list available recipes
 default:
     @just --list
@@ -19,6 +40,9 @@ check:
 # Run cargo tests
 test: build
     cargo test
+
+nextest: build
+    cargo nextest run
 
 # Generate synthetic test fixtures (requires ffmpeg)
 fixtures:

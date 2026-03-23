@@ -59,7 +59,7 @@ enum State {
     /// Waiting for the moov box (skipping ftyp and other init boxes).
     WaitingForInit,
     /// Processing moof+mdat fragment pairs.
-    Streaming(StreamingState),
+    Streaming(Box<StreamingState>),
 }
 
 struct StreamingState {
@@ -131,7 +131,7 @@ impl Segmenter {
                             data: init_data,
                         });
 
-                        self.state = State::Streaming(StreamingState {
+                        self.state = State::Streaming(Box::new(StreamingState {
                             moov,
                             video_track_ids,
                             track_state: HashMap::new(),
@@ -139,7 +139,7 @@ impl Segmenter {
                             segment_number: 0,
                             seen_first_keyframe: false,
                             pending_moof: None,
-                        });
+                        }));
                     }
                     // Skip ftyp, free, etc.
                 }
@@ -154,49 +154,49 @@ impl Segmenter {
                             moof,
                             box_size: box_total_size,
                         });
-                    } else if box_type == *b"mdat" {
-                        if let Some(pending) = ss.pending_moof.take() {
-                            // Determine mdat header size (8 for normal, 16 for extended)
-                            let mdat_header_size = if box_total_size > u32::MAX as usize {
-                                16
-                            } else {
-                                8
-                            };
-                            let mdat_payload = &box_data[mdat_header_size..];
+                    } else if box_type == *b"mdat"
+                        && let Some(pending) = ss.pending_moof.take()
+                    {
+                        // Determine mdat header size (8 for normal, 16 for extended)
+                        let mdat_header_size = if box_total_size > u32::MAX as usize {
+                            16
+                        } else {
+                            8
+                        };
+                        let mdat_payload = &box_data[mdat_header_size..];
 
-                            // Process moof+mdat into per-frame fragments
-                            let mut frames: Vec<Frame> = Vec::new();
-                            fragment::process_moof_mdat(
-                                &ss.moov,
-                                &pending.moof,
-                                pending.box_size,
-                                mdat_payload,
-                                &mut ss.track_state,
-                                &mut |frame| {
-                                    frames.push(frame);
-                                    Ok(())
-                                },
-                            )?;
+                        // Process moof+mdat into per-frame fragments
+                        let mut frames: Vec<Frame> = Vec::new();
+                        fragment::process_moof_mdat(
+                            &ss.moov,
+                            &pending.moof,
+                            pending.box_size,
+                            mdat_payload,
+                            &mut ss.track_state,
+                            &mut |frame| {
+                                frames.push(frame);
+                                Ok(())
+                            },
+                        )?;
 
-                            // Accumulate into segments, splitting at video keyframes
-                            for frame in frames {
-                                let is_video_keyframe =
-                                    ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
+                        // Accumulate into segments, splitting at video keyframes
+                        for frame in frames {
+                            let is_video_keyframe =
+                                ss.video_track_ids.contains(&frame.track_id) && frame.is_sync;
 
-                                if is_video_keyframe && ss.seen_first_keyframe {
-                                    ss.segment_number += 1;
-                                    events.push(SegmenterEvent::Segment(Segment {
-                                        number: ss.segment_number,
-                                        data: std::mem::take(&mut ss.segment_buf),
-                                    }));
-                                }
-
-                                if is_video_keyframe {
-                                    ss.seen_first_keyframe = true;
-                                }
-
-                                ss.segment_buf.extend_from_slice(&frame.data);
+                            if is_video_keyframe && ss.seen_first_keyframe {
+                                ss.segment_number += 1;
+                                events.push(SegmenterEvent::Segment(Segment {
+                                    number: ss.segment_number,
+                                    data: std::mem::take(&mut ss.segment_buf),
+                                }));
                             }
+
+                            if is_video_keyframe {
+                                ss.seen_first_keyframe = true;
+                            }
+
+                            ss.segment_buf.extend_from_slice(&frame.data);
                         }
                         // Orphan mdat without moof — skip
                     }
@@ -214,14 +214,14 @@ impl Segmenter {
     /// Signal end of stream. Flushes any remaining partial segment.
     pub fn flush(&mut self) -> Result<Vec<SegmenterEvent>> {
         let mut events = Vec::new();
-        if let State::Streaming(ss) = &mut self.state {
-            if !ss.segment_buf.is_empty() {
-                ss.segment_number += 1;
-                events.push(SegmenterEvent::Segment(Segment {
-                    number: ss.segment_number,
-                    data: std::mem::take(&mut ss.segment_buf),
-                }));
-            }
+        if let State::Streaming(ss) = &mut self.state
+            && !ss.segment_buf.is_empty()
+        {
+            ss.segment_number += 1;
+            events.push(SegmenterEvent::Segment(Segment {
+                number: ss.segment_number,
+                data: std::mem::take(&mut ss.segment_buf),
+            }));
         }
         Ok(events)
     }
