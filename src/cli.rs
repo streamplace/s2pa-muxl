@@ -12,7 +12,9 @@ fn usage() -> ! {
     eprintln!("  segment <input> --dir <output_dir>        Segment fMP4 into directory");
     eprintln!("  segment <input> --archive <output.mp4>    Segment fMP4 into archive file");
     eprintln!("  segment <input> --stdout                  Stream segments to stdout (framed)");
-    eprintln!("  concat                                    Concatenate MUXL archives from stdin (CBOR out)");
+    eprintln!(
+        "  concat                                    Concatenate MUXL archives from stdin (CBOR out)"
+    );
     eprintln!();
     eprintln!("  <input> can be a file path or \"-\" for stdin");
     process::exit(1);
@@ -179,7 +181,7 @@ fn cmd_segment_stdout(input: &mut impl Read) -> crate::Result<()> {
 fn write_cbor_event(w: &mut impl io::Write, event: &crate::SegmenterEvent) -> crate::Result<()> {
     let cbor_event = crate::cbor::CborEvent::from_event(event);
     dasl::drisl::to_writer(&mut *w, &cbor_event)
-        .map_err(|e| crate::Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| crate::Error::Io(io::Error::other(e.to_string())))?;
     w.flush()?;
     match event {
         crate::SegmenterEvent::InitSegment { data, .. } => {
