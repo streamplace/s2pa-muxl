@@ -1,5 +1,11 @@
 # muxl — deterministic MP4 canonicalization
 
+# Point git at the tracked hooks directory (run once after cloning)
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Git hooks installed from .githooks/"
+
+
 # Default: list available recipes
 default:
     @just --list
