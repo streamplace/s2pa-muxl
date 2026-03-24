@@ -1,7 +1,7 @@
 // Example: embedding muxl as a WASI module in Go via wazero.
 //
 // Pipes an fMP4 stream through the muxl WASI binary and reads back
-// CBOR (DRISL) events from stdout.
+// CBOR (DRISL) events from stdout, then generates HLS CMAF playlists.
 //
 // Build the WASM binary first:
 //
@@ -33,12 +33,43 @@ import (
 //
 // Wire format (one CBOR map per event):
 //
-//	{"type": "init", "data": h'<ftyp+moov bytes>'}
-//	{"type": "segment", "tracks": {"1": h'<video>', "2": h'<audio>'}}
+//	{"type": "init", "data": h'<ftyp+moov bytes>', "catalog": {"video": {...}, "audio": {...}}}
+//	{"type": "segment", "tracks": {"1": h'<video>', "2": h'<audio>'},
+//	 "durations": {"1": 60000, "2": 48000}, "sample_counts": {"1": 60, "2": 50}}
 type MuxlEvent struct {
-	Type   string            `cbor:"type"`
-	Data   []byte            `cbor:"data,omitempty"`
-	Tracks map[string][]byte `cbor:"tracks,omitempty"`
+	Type         string            `cbor:"type"`
+	Data         []byte            `cbor:"data,omitempty"`
+	Catalog      *Catalog          `cbor:"catalog,omitempty"`
+	TrackInits   map[string][]byte `cbor:"track_inits,omitempty"`
+	Tracks       map[string][]byte `cbor:"tracks,omitempty"`
+	Durations    map[string]uint64 `cbor:"durations,omitempty"`
+	SampleCounts map[string]uint32 `cbor:"sample_counts,omitempty"`
+}
+
+// Catalog describes all tracks in a presentation.
+type Catalog struct {
+	Video map[string]VideoTrackConfig `cbor:"video"`
+	Audio map[string]AudioTrackConfig `cbor:"audio"`
+}
+
+// VideoTrackConfig is the configuration for a video track.
+type VideoTrackConfig struct {
+	Codec       string `cbor:"codec"`
+	Description []byte `cbor:"description"`
+	CodedWidth  uint32 `cbor:"coded_width"`
+	CodedHeight uint32 `cbor:"coded_height"`
+	TrackID     uint32 `cbor:"track_id"`
+	Timescale   uint32 `cbor:"timescale"`
+}
+
+// AudioTrackConfig is the configuration for an audio track.
+type AudioTrackConfig struct {
+	Codec            string `cbor:"codec"`
+	Description      []byte `cbor:"description"`
+	SampleRate       uint32 `cbor:"sample_rate"`
+	NumberOfChannels uint32 `cbor:"number_of_channels"`
+	TrackID          uint32 `cbor:"track_id"`
+	Timescale        uint32 `cbor:"timescale"`
 }
 
 func main() {
@@ -64,15 +95,25 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Feed events into the playlist generator
+	gen := NewPlaylistGenerator()
 	for _, ev := range events {
-		switch ev.Type {
-		case "init":
-			fmt.Fprintf(os.Stderr, "init segment: %d bytes\n", len(ev.Data))
-		case "segment":
-			for trackID, data := range ev.Tracks {
-				fmt.Fprintf(os.Stderr, "segment track %s: %d bytes\n", trackID, len(data))
+		if err := gen.HandleEvent(ev); err != nil {
+			log.Fatal(err)
+		}
+	}
+	gen.Close()
+
+	// Print playlists
+	fmt.Fprintf(os.Stderr, "--- master.m3u8 ---\n%s\n", gen.MasterPlaylist())
+	for _, tid := range gen.TrackIDs() {
+		name := fmt.Sprintf("video-%s.m3u8", tid)
+		for _, a := range gen.catalog.Audio {
+			if fmt.Sprintf("%d", a.TrackID) == tid {
+				name = fmt.Sprintf("audio-%s.m3u8", tid)
 			}
 		}
+		fmt.Fprintf(os.Stderr, "--- %s ---\n%s\n", name, gen.MediaPlaylist(tid))
 	}
 }
 

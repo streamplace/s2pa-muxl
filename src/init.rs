@@ -131,6 +131,39 @@ pub fn build_init_segment(catalog: &Catalog) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Build per-track init segments from a Catalog.
+///
+/// Returns a map of track_id → single-track ftyp+moov bytes. Each init
+/// segment contains only the moov data for that one track, suitable for
+/// HLS CMAF media playlists where each track needs its own init segment.
+pub fn build_track_init_segments(catalog: &Catalog) -> Result<std::collections::BTreeMap<u32, Vec<u8>>> {
+    let mut result = std::collections::BTreeMap::new();
+
+    for config in catalog.video.values() {
+        let single = Catalog {
+            video: std::collections::BTreeMap::from([(
+                format!("video{}", config.track_id),
+                config.clone(),
+            )]),
+            audio: std::collections::BTreeMap::new(),
+        };
+        result.insert(config.track_id, build_init_segment(&single)?);
+    }
+
+    for config in catalog.audio.values() {
+        let single = Catalog {
+            video: std::collections::BTreeMap::new(),
+            audio: std::collections::BTreeMap::from([(
+                format!("audio{}", config.track_id),
+                config.clone(),
+            )]),
+        };
+        result.insert(config.track_id, build_init_segment(&single)?);
+    }
+
+    Ok(result)
+}
+
 // --- Internal helpers ---
 
 enum TrackDef<'a> {
