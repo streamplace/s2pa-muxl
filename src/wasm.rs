@@ -27,10 +27,11 @@
 //! const final_events = segmenter.flush();
 //! ```
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect, SharedArrayBuffer, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 use crate::push::{Segmenter, SegmenterEvent};
+use crate::wasm_io::{WasmReadAt, WasmWriteAt};
 
 /// MUXL streaming segmenter for WebAssembly.
 ///
@@ -71,6 +72,47 @@ impl WasmSegmenter {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(events_to_js(events))
     }
+}
+
+/// Convert a flat MP4 to a MUXL archive, streaming I/O through SharedArrayBuffers.
+///
+/// - `read_sab`: SharedArrayBuffer for reading from the input file (ReadAt protocol)
+/// - `write_sab`: SharedArrayBuffer for writing archive output (Write protocol)
+///
+/// The main thread must:
+/// 1. Fulfill read requests on `read_sab` (via `Blob.slice()`)
+/// 2. Drain write chunks from `write_sab` (to BLAKE3 hasher + S3 upload)
+///
+/// Returns a JSON string containing the track metadata (codecs, segments,
+/// init CIDs, byte offsets). Init segment data is written to `write_sab`
+/// before the archive data, prefixed by a 4-byte LE length for each track's
+/// init segment.
+#[wasm_bindgen]
+pub fn convert_flat_mp4(read_sab: &SharedArrayBuffer, write_sab: &SharedArrayBuffer) -> Result<String, JsValue> {
+    let reader = WasmReadAt::new(read_sab)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mut writer = WasmWriteAt::new(write_sab)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let tracks = crate::flat_mp4_to_archive(&reader, &mut writer)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Write init segments to the output stream so the main thread can upload them.
+    // Format: [4-byte LE length][init data] for each track, in order.
+    use std::io::Write;
+    for track in &tracks {
+        let len = (track.init_data.len() as u32).to_le_bytes();
+        writer.write_all(&len).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        writer.write_all(&track.init_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+
+    // Signal end of stream
+    writer.finish();
+
+    // Return track metadata as JSON (small — just offsets, codecs, CIDs)
+    let json = serde_json::to_string(&tracks)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(json)
 }
 
 fn events_to_js(events: Vec<SegmenterEvent>) -> Array {

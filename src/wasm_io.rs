@@ -1,8 +1,8 @@
-//! WASM [`ReadAt`] implementation using SharedArrayBuffer + Atomics.
+//! WASM I/O implementations using SharedArrayBuffer + Atomics.
 //!
-//! The WASM code runs in a Web Worker and blocks on `Atomics.wait()` when
-//! it needs data. The main thread (or another worker) fulfills read requests
-//! via `Blob.slice()` and signals completion with `Atomics.notify()`.
+//! Provides [`WasmReadAt`] (input) and [`WasmWriteAt`] (output) that
+//! communicate with the JS main thread through SharedArrayBuffers.
+//! The WASM code runs in a Web Worker and blocks on `Atomics.wait()`.
 //!
 //! # SharedArrayBuffer layout
 //!
@@ -204,7 +204,152 @@ mod inner {
             }
         }
     }
+    // -----------------------------------------------------------------------
+    // WasmWriteAt — output SAB, implements std::io::Write
+    // -----------------------------------------------------------------------
+
+    /// Status values for the write SAB protocol.
+    const WRITE_STATUS_IDLE: i32 = 0;
+    const WRITE_STATUS_CHUNK_READY: i32 = 1;
+    const WRITE_STATUS_CONSUMED: i32 = 2;
+    const WRITE_STATUS_ERROR: i32 = 3;
+    /// Signals end-of-stream (WASM is done writing).
+    const WRITE_STATUS_DONE: i32 = 4;
+
+    /// Write SAB layout (same 32-byte header as read SAB):
+    /// [0..4]   i32  status
+    /// [4..8]   u32  chunk_size (bytes in data region)
+    /// [8..16]  (reserved)
+    /// [16..24] u64  total_bytes_written (running total, updated each chunk)
+    /// [24..32] (reserved)
+    /// [32..]   data region
+    const WRITE_OFFSET_STATUS: usize = 0;
+    const WRITE_OFFSET_CHUNK_SIZE: usize = 4;
+    const WRITE_OFFSET_TOTAL: usize = 16;
+    const WRITE_OFFSET_DATA: usize = 32;
+
+    /// [`Write`] implementation that sends chunks to the JS main thread
+    /// via SharedArrayBuffer + Atomics.
+    ///
+    /// When `write()` is called, the data is copied into the SAB data region,
+    /// status is set to CHUNK_READY, and WASM blocks until the main thread
+    /// sets status to CONSUMED.
+    pub struct WasmWriteAt {
+        sab_ptr: *mut u8,
+        sab_len: usize,
+        total_written: u64,
+    }
+
+    unsafe impl Send for WasmWriteAt {}
+    unsafe impl Sync for WasmWriteAt {}
+
+    impl WasmWriteAt {
+        pub fn new(sab: &SharedArrayBuffer) -> io::Result<Self> {
+            let sab_len = sab.byte_length() as usize;
+            if sab_len < WRITE_OFFSET_DATA + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Write SAB too small: {} bytes", sab_len),
+                ));
+            }
+            let sab_ptr = js_sys::Uint8Array::new(sab).as_ptr() as *mut u8;
+
+            // Initialize status to IDLE
+            unsafe {
+                std::sync::atomic::AtomicI32::from_ptr(
+                    sab_ptr.add(WRITE_OFFSET_STATUS) as *mut i32,
+                ).store(WRITE_STATUS_IDLE, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            Ok(Self {
+                sab_ptr,
+                sab_len,
+                total_written: 0,
+            })
+        }
+
+        fn max_data_size(&self) -> usize {
+            self.sab_len - WRITE_OFFSET_DATA
+        }
+
+        fn atomic_wait(&self, expected: i32) {
+            unsafe {
+                let status_ptr = self.sab_ptr.add(WRITE_OFFSET_STATUS) as *const i32;
+                core::arch::wasm32::memory_atomic_wait32(status_ptr, expected, -1);
+            }
+        }
+
+        fn atomic_store_notify(&self, value: i32) {
+            unsafe {
+                let status_ptr = self.sab_ptr.add(WRITE_OFFSET_STATUS) as *mut i32;
+                std::sync::atomic::AtomicI32::from_ptr(status_ptr)
+                    .store(value, std::sync::atomic::Ordering::SeqCst);
+                core::arch::wasm32::memory_atomic_notify(status_ptr as *mut i32, 1);
+            }
+        }
+
+        /// Signal to the main thread that writing is complete.
+        pub fn finish(&self) {
+            self.atomic_store_notify(WRITE_STATUS_DONE);
+        }
+    }
+
+    impl io::Write for WasmWriteAt {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+
+            // Write in chunks that fit the data region
+            let chunk_size = buf.len().min(self.max_data_size());
+
+            unsafe {
+                // Copy data into SAB data region
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    self.sab_ptr.add(WRITE_OFFSET_DATA),
+                    chunk_size,
+                );
+
+                // Write chunk size
+                std::ptr::write(
+                    self.sab_ptr.add(WRITE_OFFSET_CHUNK_SIZE) as *mut [u8; 4],
+                    (chunk_size as u32).to_le_bytes(),
+                );
+
+                self.total_written += chunk_size as u64;
+
+                // Write total bytes
+                std::ptr::write(
+                    self.sab_ptr.add(WRITE_OFFSET_TOTAL) as *mut [u8; 8],
+                    self.total_written.to_le_bytes(),
+                );
+
+                // Signal chunk ready and wait for main thread to consume
+                self.atomic_store_notify(WRITE_STATUS_CHUNK_READY);
+                self.atomic_wait(WRITE_STATUS_CHUNK_READY);
+
+                // Check for error
+                let status = std::sync::atomic::AtomicI32::from_ptr(
+                    self.sab_ptr.add(WRITE_OFFSET_STATUS) as *mut i32,
+                ).load(std::sync::atomic::Ordering::SeqCst);
+
+                if status == WRITE_STATUS_ERROR {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "JS write consumer reported an error",
+                    ));
+                }
+            }
+
+            Ok(chunk_size)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "wasm")]
-pub use inner::WasmReadAt;
+pub use inner::{WasmReadAt, WasmWriteAt};

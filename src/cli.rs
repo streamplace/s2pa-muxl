@@ -237,12 +237,15 @@ fn cmd_concat() -> crate::Result<()> {
 
 /// Per-track info extracted from an archive, with byte offsets and blob CID.
 /// Metadata for one track in a MUXL archive.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArchiveTrack {
     pub track_id: u32,
     pub track_type: String, // "video" or "audio"
     pub codec: String,
     pub timescale: u32,
     pub init_cid: String,
+    #[serde(skip)]
     pub init_data: Vec<u8>,
     pub blob_cid: String,
     pub blob_size: u64,
@@ -256,6 +259,8 @@ pub struct ArchiveTrack {
 }
 
 /// Byte-range segment metadata within a MUXL archive.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArchiveSegment {
     pub offset: u64,
     pub size: u64,
