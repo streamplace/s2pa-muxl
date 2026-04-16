@@ -6,6 +6,14 @@ MUXL produces byte-identical MP4 output from the same logical content, enabling 
 
 Part of the [DASL](https://dasl.ing) ecosystem.
 
+## This Repo
+
+This repo contains:
+
+1. The Rust implementation of MUXL, and tools for compiling to WASM. (`src`)
+2. An example of how to embed MUXL's WASM into a Go library. (`examples/go-wasi`)
+3. An example TypeScript worker, providing tooling for working with MUXL HLS playlists.
+
 ## How it works
 
 Video encoders produce identical encoded frames, but different muxers (ffmpeg, GStreamer, MP4Box) wrap them in different container structures — different field orderings, timestamps, metadata. MUXL defines a single canonical container form and converts any fMP4 input to it.
