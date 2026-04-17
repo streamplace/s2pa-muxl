@@ -32,7 +32,9 @@ Timescale passthrough is fine for the livestream ingest use case (single source 
 
 ## Audio priming sample handling
 
-Muxers disagree on how to handle Opus/AAC encoder delay (priming samples):
+Edit lists (including empty edits used for priming / A/V alignment) are currently preserved from source to output verbatim. This means the MUXL fMP4 and flat MP4 both carry whatever `elst` the source had. This resolves simple cases (e.g., a LosslessCut clip with a 9 ms empty video edit) but doesn't converge encoder-specific priming conventions.
+
+Muxers still disagree on how to handle Opus/AAC encoder delay (priming samples):
 
 - **ffmpeg/mp4box**: keep the priming sample in mdat, use `elst` with `media_time=312` to skip past it during playback. 51 audio samples.
 - **gstreamer**: drops the first audio sample from mdat entirely, uses a 2-entry elst with an empty edit (media_time=-1) for the gap. 50 audio samples.

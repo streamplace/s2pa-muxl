@@ -1024,6 +1024,48 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_preserves_edit_list_round_trip() {
+        // Simulate the LosslessCut scenario: start from a fixture, inject a
+        // 9ms empty video edit into the catalog, build a fresh hybrid flat
+        // MP4, and verify the output's catalog carries the same edit list.
+        // This is the fragments+catalog round-trip a real flow does.
+        use crate::catalog::EditEntry;
+
+        let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
+        let (mut catalog, plans) = plan_from_flat_mp4(&flat_input).unwrap();
+
+        let (_, video) = catalog.video.iter_mut().next().unwrap();
+        video.edits = Some(vec![
+            EditEntry {
+                segment_duration: 9,
+                media_time: -1,
+                media_rate: 1,
+                media_rate_fraction: 0,
+            },
+            EditEntry {
+                segment_duration: 2000,
+                media_time: 0,
+                media_rate: 1,
+                media_rate_fraction: 0,
+            },
+        ]);
+
+        let mut out = Vec::new();
+        write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();
+
+        let out_catalog = crate::catalog_from_mp4(Cursor::new(&out)).unwrap();
+        let out_video = out_catalog.video.values().next().unwrap();
+        let edits = out_video
+            .edits
+            .as_ref()
+            .expect("hybrid output should preserve video edit list");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].segment_duration, 9);
+        assert_eq!(edits[0].media_time, -1);
+        assert_eq!(edits[1].segment_duration, 2000);
+    }
+
+    #[test]
     fn flat_ctts_rle_merges_equal_offsets() {
         let entries = rle_ctts(vec![0, 0, 100, 100, -50].into_iter());
         assert_eq!(

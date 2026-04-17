@@ -707,6 +707,43 @@ mod tests {
     }
 
     #[test]
+    fn test_edit_list_round_trips_through_init() {
+        // Inject a LosslessCut-style 9ms empty video edit into an otherwise
+        // normal catalog, round-trip through build_init_segment +
+        // catalog_from_mp4, and confirm the edit list survives.
+        let data = read_fixture("h264-aac.mp4");
+        let mut catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
+
+        let (_, video) = catalog.video.iter_mut().next().unwrap();
+        // Two-entry elst: 9ms empty edit, then remainder starting at media_time 0.
+        video.edits = Some(vec![
+            EditEntry {
+                segment_duration: 9,
+                media_time: -1,
+                media_rate: 1,
+                media_rate_fraction: 0,
+            },
+            EditEntry {
+                segment_duration: 2000,
+                media_time: 0,
+                media_rate: 1,
+                media_rate_fraction: 0,
+            },
+        ]);
+
+        let init = build_init_segment(&catalog).unwrap();
+        let catalog2 = catalog_from_mp4(Cursor::new(init)).unwrap();
+
+        let v2 = catalog2.video.values().next().unwrap();
+        let edits = v2.edits.as_ref().expect("edit list missing after round-trip");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].segment_duration, 9);
+        assert_eq!(edits[0].media_time, -1, "empty edit media_time must stay -1");
+        assert_eq!(edits[1].segment_duration, 2000);
+        assert_eq!(edits[1].media_time, 0);
+    }
+
+    #[test]
     fn test_init_idempotent() {
         let data = read_fixture("h264-opus.mp4");
         let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();

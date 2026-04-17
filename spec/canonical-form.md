@@ -204,7 +204,9 @@ stsd populated with codec config, all other tables empty.
 
 ### edts / elst
 
-From track config. segment_duration in movie timescale (1000). media_time in the track's media timescale.
+Optional. When present in the source track, preserved byte-for-byte on output. `segment_duration` is in the movie timescale (1000); `media_time` is in the track's media timescale, with `-1` denoting an empty edit.
+
+Edit lists are track-level presentation metadata, not per-fragment metadata — they live in the init segment (or in the MUXL flat MP4 moov), not in individual MUXL fragments or segments. A fragments-only round-trip drops edit lists; fragments + catalog preserves them, because the catalog carries `VideoTrackConfig::edits` / `AudioTrackConfig::edits`.
 
 ## Stripped Boxes
 
