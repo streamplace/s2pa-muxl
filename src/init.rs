@@ -9,12 +9,12 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mp4_atom::{
-    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Encode, Esds, Ftyp, Hdlr,
-    Header, Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom, Stbl, Stco, Stsc,
-    Stsd, Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
+    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Edts, Elst, ElstEntry, Encode,
+    Esds, Ftyp, Hdlr, Header, Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom,
+    Stbl, Stco, Stsc, Stsd, Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
 };
 
-use crate::catalog::{AudioTrackConfig, Catalog, VideoTrackConfig};
+use crate::catalog::{AudioTrackConfig, Catalog, EditEntry, VideoTrackConfig};
 use crate::error::{Error, Result};
 
 // Canonical timescale for mvhd (movie-level, not media-level)
@@ -207,11 +207,57 @@ pub fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<Moov> {
     }
 }
 
+/// Extract a track's edit list, if present. Applies a v0→v1 sign fix for
+/// `media_time` values that look like v0-truncated negatives (most commonly
+/// `-1`, used for empty edits), which mp4-atom's decoder stores as
+/// `0xFFFFFFFF` regardless of source version.
+fn extract_edits(trak: &Trak) -> Option<Vec<EditEntry>> {
+    let elst = trak.edts.as_ref()?.elst.as_ref()?;
+    let mut out = Vec::with_capacity(elst.entries.len());
+    for e in &elst.entries {
+        // Sign-extend values that came from v0 as negative i32.
+        // mp4-atom decodes v0 u32 into u64 without sign extension, so values
+        // in [0x80000000, 0xFFFFFFFF] with upper 32 bits zero need fixing.
+        let mt_u = e.media_time;
+        let media_time = if (mt_u >> 32) == 0 && (mt_u & 0x8000_0000) != 0 {
+            (mt_u | 0xFFFF_FFFF_0000_0000) as i64
+        } else {
+            mt_u as i64
+        };
+        out.push(EditEntry {
+            segment_duration: e.segment_duration,
+            media_time,
+            media_rate: e.media_rate,
+            media_rate_fraction: e.media_rate_fraction,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Build an Edts from our EditEntry list. mp4-atom always encodes v1, so a
+/// negative `media_time` passes through correctly as its i64 bit pattern.
+fn build_edts(edits: &[EditEntry]) -> Edts {
+    Edts {
+        elst: Some(Elst {
+            entries: edits
+                .iter()
+                .map(|e| ElstEntry {
+                    segment_duration: e.segment_duration,
+                    media_time: e.media_time as u64,
+                    media_rate: e.media_rate,
+                    media_rate_fraction: e.media_rate_fraction,
+                })
+                .collect(),
+        }),
+    }
+}
+
 /// Extract video track config from a trak.
 fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
 
+    let edits = extract_edits(trak);
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
             Codec::Avc1(avc1) => {
@@ -229,6 +275,7 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_height: avc1.visual.height as u32,
                     track_id,
                     timescale,
+                    edits,
                 }));
             }
             Codec::Av01(av01) => {
@@ -252,6 +299,7 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_height: av01.visual.height as u32,
                     track_id,
                     timescale,
+                    edits,
                 }));
             }
             _ => continue,
@@ -265,6 +313,7 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
 
+    let edits = extract_edits(trak);
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
             Codec::Opus(opus) => {
@@ -276,6 +325,7 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     number_of_channels: opus.audio.channel_count as u32,
                     track_id,
                     timescale,
+                    edits,
                 }));
             }
             Codec::Mp4a(mp4a) => {
@@ -289,6 +339,7 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     number_of_channels: mp4a.audio.channel_count as u32,
                     track_id,
                     timescale,
+                    edits,
                 }));
             }
             _ => continue,
@@ -399,7 +450,7 @@ pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             width: (config.coded_width as u16).into(),
             height: (config.coded_height as u16).into(),
         },
-        edts: None,
+        edts: config.edits.as_ref().map(|e| build_edts(e)),
         meta: None,
         mdia: Mdia {
             mdhd: Mdhd {
@@ -478,7 +529,7 @@ pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             width: 0u16.into(),
             height: 0u16.into(),
         },
-        edts: None,
+        edts: config.edits.as_ref().map(|e| build_edts(e)),
         meta: None,
         mdia: Mdia {
             mdhd: Mdhd {
