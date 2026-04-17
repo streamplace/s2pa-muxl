@@ -12,6 +12,7 @@ wasm = ["wasm-bindgen", "js-sys"]
 
 [dependencies]
 blake3 = "1"
+clap = { version = "4", features = ["derive"] }
 dasl = "0.2"
 mp4-atom = { git = "https://github.com/streamplace/mp4-atom.git", branch = "streamplace" }
 serde = { version = "1", features = ["derive"] }

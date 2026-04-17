@@ -1,43 +1,86 @@
-use std::env;
 use std::fs;
 use std::io::{self, BufWriter, Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
-fn usage() -> ! {
-    eprintln!("Usage: muxl <command> [args...]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  catalog <input.mp4>                       Extract catalog from MP4");
-    eprintln!("  init <input.mp4> <output_init.mp4>        Build canonical init segment");
-    eprintln!("  flat <input.mp4> <output.mp4>             Build canonical MUXL flat MP4 (faststart)");
-    eprintln!("  segment <input> --dir <output_dir>        Segment fMP4 into directory");
-    eprintln!("  segment <input> --fmp4 <output.mp4>       Segment fMP4 into a single MUXL fMP4 file");
-    eprintln!("  segment <input> --stdout                  Stream segments to stdout (framed)");
-    eprintln!("  concat                                    Concatenate MUXL fMP4 files from stdin (CBOR out)");
-    eprintln!("  hls <input.mp4> <output_dir> [--blobs <dir>]  Generate HLS playlists");
-    eprintln!();
-    eprintln!("  <input> can be a file path or \"-\" for stdin");
-    process::exit(1);
+use clap::{ArgGroup, Args, Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "muxl", about = "Deterministic MP4 canonicalization tool", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Extract catalog (track config) from an MP4.
+    Catalog {
+        /// Input MP4 file.
+        input: PathBuf,
+    },
+    /// Build the canonical init segment (ftyp+moov) for an MP4.
+    Init {
+        /// Input MP4 file.
+        input: PathBuf,
+        /// Output init segment path.
+        output: PathBuf,
+    },
+    /// Build a canonical MUXL flat MP4 (faststart) from an input MP4.
+    Flat {
+        /// Input MP4 file (flat or fragmented).
+        input: PathBuf,
+        /// Output flat MP4 path.
+        output: PathBuf,
+    },
+    /// Segment an fMP4 into per-GoP MUXL segments.
+    Segment(SegmentArgs),
+    /// Concatenate MUXL fMP4 files from stdin, emit CBOR events to stdout.
+    Concat,
+    /// Generate HLS playback artifacts (CID-addressed blobs + optional playlists).
+    Hls(HlsArgs),
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("mode").required(true).args(["dir", "fmp4", "stdout"])))]
+struct SegmentArgs {
+    /// Input fMP4 file, or "-" for stdin.
+    input: String,
+    /// Write segments into this directory (one file per segment).
+    #[arg(long, value_name = "DIR")]
+    dir: Option<PathBuf>,
+    /// Emit a single MUXL fMP4 file covering the whole input.
+    #[arg(long, value_name = "FILE")]
+    fmp4: Option<PathBuf>,
+    /// Stream segments to stdout as framed CBOR events.
+    #[arg(long)]
+    stdout: bool,
+}
+
+#[derive(Args)]
+struct HlsArgs {
+    /// Input MP4 file (flat or fragmented).
+    input: PathBuf,
+    /// Output directory for content-addressed blobs.
+    output_dir: PathBuf,
+    /// Alternate rendition from another MP4 file (repeatable).
+    #[arg(long = "sidecar", value_name = "FILE")]
+    sidecars: Vec<PathBuf>,
+    /// Also generate static HLS playlists (master.m3u8, per-track media playlists).
+    #[arg(long)]
+    playlists: bool,
 }
 
 pub fn cli_main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        usage();
-    }
+    let cli = Cli::parse();
 
-    let result = match args[1].as_str() {
-        "catalog" => cmd_catalog(&args[2..]),
-        "init" => cmd_init(&args[2..]),
-        "flat" => cmd_flat(&args[2..]),
-        "segment" => cmd_segment(&args[2..]),
-        "concat" => cmd_concat(),
-        "hls" => cmd_hls(&args[2..]),
-        _ => {
-            eprintln!("Unknown command: {}", args[1]);
-            usage();
-        }
+    let result = match cli.command {
+        Command::Catalog { input } => cmd_catalog(&input),
+        Command::Init { input, output } => cmd_init(&input, &output),
+        Command::Flat { input, output } => cmd_flat(&input, &output),
+        Command::Segment(args) => cmd_segment(args),
+        Command::Concat => cmd_concat(),
+        Command::Hls(args) => cmd_hls(args),
     };
 
     if let Err(e) = result {
@@ -46,12 +89,8 @@ pub fn cli_main() {
     }
 }
 
-fn cmd_catalog(args: &[String]) -> crate::Result<()> {
-    if args.len() != 1 {
-        eprintln!("Usage: muxl catalog <input.mp4>");
-        process::exit(1);
-    }
-    let data = fs::read(&args[0])?;
+fn cmd_catalog(input: &Path) -> crate::Result<()> {
+    let data = fs::read(input)?;
     let catalog = crate::catalog_from_mp4(Cursor::new(data))?;
 
     for (name, v) in &catalog.video {
@@ -78,26 +117,18 @@ fn cmd_catalog(args: &[String]) -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_init(args: &[String]) -> crate::Result<()> {
-    if args.len() != 2 {
-        eprintln!("Usage: muxl init <input.mp4> <output_init.mp4>");
-        process::exit(1);
-    }
-    let data = fs::read(&args[0])?;
+fn cmd_init(input: &Path, output: &Path) -> crate::Result<()> {
+    let data = fs::read(input)?;
     let catalog = crate::catalog_from_mp4(Cursor::new(data))?;
     let init = crate::build_init_segment(&catalog)?;
-    fs::write(&args[1], &init)?;
+    fs::write(output, &init)?;
     eprintln!("Wrote {} bytes", init.len());
     Ok(())
 }
 
-fn cmd_flat(args: &[String]) -> crate::Result<()> {
-    if args.len() != 2 {
-        eprintln!("Usage: muxl flat <input.mp4> <output.mp4>");
-        process::exit(1);
-    }
-    let input = crate::io::FileReadAt::open(Path::new(&args[0]))?;
-    let out_file = fs::File::create(&args[1])?;
+fn cmd_flat(input: &Path, output: &Path) -> crate::Result<()> {
+    let input = crate::io::FileReadAt::open(input)?;
+    let out_file = fs::File::create(output)?;
     let mut out = BufWriter::new(out_file);
     let info = crate::flat::flat_mp4_to_flat(&input, &mut out)?;
     out.flush()?;
@@ -110,51 +141,26 @@ fn cmd_flat(args: &[String]) -> crate::Result<()> {
     Ok(())
 }
 
-fn cmd_segment(args: &[String]) -> crate::Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: muxl segment <input> --dir <output_dir>");
-        eprintln!("       muxl segment <input> --fmp4 <output.mp4>");
-        eprintln!("       muxl segment <input> --stdout");
-        eprintln!("  <input> can be a file path or \"-\" for stdin");
-        process::exit(1);
-    }
-
-    let input_path = &args[0];
-    let mode = &args[1];
-
-    // Open input: file or stdin
-    let mut input: Box<dyn Read> = if input_path == "-" {
+fn cmd_segment(args: SegmentArgs) -> crate::Result<()> {
+    let mut input: Box<dyn Read> = if args.input == "-" {
         Box::new(io::stdin().lock())
     } else {
-        Box::new(fs::File::open(input_path)?)
+        Box::new(fs::File::open(&args.input)?)
     };
 
-    match mode.as_str() {
-        "--dir" => {
-            let output_path = args.get(2).unwrap_or_else(|| {
-                eprintln!("Missing output directory");
-                process::exit(1);
-            });
-            cmd_segment_dir(&mut input, output_path)
-        }
-        "--fmp4" => {
-            let output_path = args.get(2).unwrap_or_else(|| {
-                eprintln!("Missing output file");
-                process::exit(1);
-            });
-            cmd_segment_fmp4(&mut input, output_path)
-        }
-        "--stdout" => cmd_segment_stdout(&mut input),
-        _ => {
-            eprintln!("Unknown segment mode: {mode}");
-            eprintln!("Use --dir, --fmp4, or --stdout");
-            process::exit(1);
-        }
+    if let Some(dir) = args.dir {
+        cmd_segment_dir(&mut input, &dir)
+    } else if let Some(file) = args.fmp4 {
+        cmd_segment_fmp4(&mut input, &file)
+    } else if args.stdout {
+        cmd_segment_stdout(&mut input)
+    } else {
+        // clap's ArgGroup guarantees one mode is set; unreachable in practice.
+        unreachable!("segment requires --dir, --fmp4, or --stdout")
     }
 }
 
-fn cmd_segment_dir(input: &mut impl Read, output_dir: &str) -> crate::Result<()> {
-    let output_dir = std::path::Path::new(output_dir);
+fn cmd_segment_dir(input: &mut impl Read, output_dir: &Path) -> crate::Result<()> {
     fs::create_dir_all(output_dir)?;
 
     let catalog = crate::segment_fmp4(input, |gop| {
@@ -446,14 +452,14 @@ pub fn flat_mp4_to_fmp4<R: crate::io::ReadAt + ?Sized, W: Write>(
 
 /// Analyze an fMP4 file and return per-track HLS metadata.
 /// Accepts both MUXL fMP4s and flat MP4 files (auto-detected).
-fn analyze_input(path: &str, blobs_dir: Option<&Path>) -> crate::Result<Vec<BlobTrack>> {
+fn analyze_input(path: &Path, blobs_dir: Option<&Path>) -> crate::Result<Vec<BlobTrack>> {
     // Convert the input (flat MP4 or MUXL fMP4 — auto-detected) into a
     // canonical MUXL flat MP4 on disk. That single file is what lands in the
     // blobs dir: it's a valid downloadable MP4 *and* a byte-range CMAF source
     // for HLS playback.
     let tmp = tempfile::NamedTempFile::new()?;
     let info = {
-        let input = crate::io::FileReadAt::open(Path::new(path))?;
+        let input = crate::io::FileReadAt::open(path)?;
         let mut output = BufWriter::new(tmp.as_file());
         let info = crate::flat::to_flat(&input, &mut output)?;
         output.flush()?;
@@ -617,67 +623,20 @@ fn group_fragments_audio(
     }
     segments
 }
-fn cmd_hls(args: &[String]) -> crate::Result<()> {
-    if args.is_empty() || args.len() < 2 || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("Process an MP4 file into content-addressed blobs for the VOD worker.");
-        eprintln!();
-        eprintln!("Usage: muxl hls <input.mp4> <output_dir> [options]");
-        eprintln!();
-        eprintln!("Arguments:");
-        eprintln!("  <input.mp4>       Input MP4 file (flat or fragmented)");
-        eprintln!("  <output_dir>      Output directory for content-addressed blobs");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --sidecar <file>  Add an alternate rendition from another MP4 file.");
-        eprintln!("                    Can be repeated. Each sidecar gets its own blob.");
-        eprintln!("                    Example: --sidecar aac-audio.mp4 --sidecar 720p.mp4");
-        eprintln!("  --playlists       Also generate static HLS playlists (master.m3u8,");
-        eprintln!("                    per-track media playlists, init segments) for serving");
-        eprintln!("                    directly from a file server without the VOD worker.");
-        eprintln!();
-        eprintln!("Output (always):");
-        eprintln!("  <output_dir>/CID.mp4     Content-addressed MUXL flat MP4 blob");
-        eprintln!("                           (plays as a regular MP4 and serves HLS byte-range");
-        eprintln!("                            fragments from the same file)");
-        eprintln!("  <output_dir>/INIT_CID.mp4  Per-track init segment blobs");
-        eprintln!("  <output_dir>/CID.json    Playback metadata (tracks, segments, byte offsets)");
-        eprintln!();
-        eprintln!("Output (with --playlists):");
-        eprintln!("  <output_dir>/master.m3u8       HLS master playlist");
-        eprintln!("  <output_dir>/video-N.m3u8      Per-track video media playlists");
-        eprintln!("  <output_dir>/audio-N.m3u8      Per-track audio media playlists");
-        process::exit(if args.first().is_some_and(|a| a == "--help" || a == "-h") { 0 } else { 1 });
-    }
-    let input_path = &args[0];
-    let output_dir = Path::new(&args[1]);
+fn cmd_hls(args: HlsArgs) -> crate::Result<()> {
+    let HlsArgs {
+        input: input_path,
+        output_dir,
+        sidecars: sidecar_paths,
+        playlists: write_playlists,
+    } = args;
 
-    // Parse flags
-    let mut sidecar_paths: Vec<&str> = Vec::new();
-    let mut write_playlists = false;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--playlists" => {
-                write_playlists = true;
-                i += 1;
-            }
-            "--sidecar" => {
-                sidecar_paths.push(args.get(i + 1).unwrap_or_else(|| {
-                    eprintln!("Missing file after --sidecar");
-                    process::exit(1);
-                }));
-                i += 2;
-            }
-            _ => { i += 1; }
-        }
-    }
-
-    fs::create_dir_all(output_dir)?;
+    fs::create_dir_all(&output_dir)?;
     // output_dir is the blobs directory — all CID-addressed files go here
-    let blobs_dir = Some(output_dir);
+    let blobs_dir = Some(output_dir.as_path());
 
     // Analyze main fMP4 and all sidecars
-    let mut all_tracks: Vec<BlobTrack> = analyze_input(input_path, blobs_dir)?;
+    let mut all_tracks: Vec<BlobTrack> = analyze_input(&input_path, blobs_dir)?;
     let primary_blob_cid = all_tracks.first().map(|t| t.blob_cid.clone()).unwrap_or_default();
     let primary_blob_size = all_tracks.first().map(|t| t.blob_size).unwrap_or(0);
 
@@ -916,7 +875,7 @@ fn base32_lower_encode(data: &[u8], out: &mut String) {
 }
 
 
-fn cmd_segment_fmp4(input: &mut impl Read, output_path: &str) -> crate::Result<()> {
+fn cmd_segment_fmp4(input: &mut impl Read, output_path: &Path) -> crate::Result<()> {
     let mut gops = Vec::new();
 
     let catalog = crate::segment_fmp4(input, |gop| {
