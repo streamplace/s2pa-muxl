@@ -341,7 +341,10 @@ pub fn flat_mp4_to_fmp4<R: crate::io::ReadAt + ?Sized, W: Write>(
         let trak = moov.trak.iter().find(|t| t.tkhd.track_id == tid)
             .ok_or_else(|| crate::Error::InvalidMp4(format!("track {tid} not found")))?;
         let samples = extract_flat_track_info(trak)?;
-        let mut decode_time: u64 = 0;
+        // Bake any leading-empty-edit presentation offset into the first
+        // fragment's tfdt (canonical form has no elst in the init segment).
+        let mut decode_time: u64 =
+            crate::init::start_offset_from_trak(trak, moov.mvhd.timescale);
         let mut segments: Vec<BlobSegment> = Vec::new();
         let mut cur_seg_offset = write_offset;
         let mut cur_seg_size: u64 = 0;

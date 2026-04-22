@@ -204,9 +204,20 @@ stsd populated with codec config, all other tables empty.
 
 ### edts / elst
 
-Optional. When present in the source track, preserved byte-for-byte on output. `segment_duration` is in the movie timescale (1000); `media_time` is in the track's media timescale, with `-1` denoting an empty edit.
+Never emitted in the init segment's moov.
 
-Edit lists are track-level presentation metadata, not per-fragment metadata — they live in the init segment (or in the MUXL flat MP4 moov), not in individual MUXL fragments or segments. A fragments-only round-trip drops edit lists; fragments + catalog preserves them, because the catalog carries `VideoTrackConfig::edits` / `AudioTrackConfig::edits`.
+Edit lists are a pre-CMAF mechanism for expressing presentation-start offsets (e.g. a LosslessCut clip that delays one track by 9 ms to align video keyframes with an audio cut). CMAF has a native mechanism for the same thing — the per-track `tfdt` on the first fragment — so the canonical init segment drops elst and instead expects the offset to be baked into the first fragment's `base_media_decode_time`.
+
+Round-trip:
+
+1. **Source → MUXL.** Any leading empty-edit entries (`media_time == -1`) at the head of a source track's `elst` are summed, rescaled from the movie timescale into the track's media timescale, and baked into the first MUXL fragment's `tfdt`. Any non-empty entries are discarded; a canonical MUXL track's media timeline begins at `media_time == 0`.
+2. **MUXL → flat MP4.** If a track carries a non-zero first-fragment `tfdt`, `write_flat_mp4` synthesizes a canonical two-entry `elst` in that track's `trak`:
+   - Entry 1: `segment_duration = tfdt_movie_ts, media_time = -1` (empty edit)
+   - Entry 2: `segment_duration = media_duration_movie_ts, media_time = 0` (normal play)
+   A zero offset produces no `edts` box at all.
+3. **MUXL → fragments.** First fragment's `tfdt` carries the offset; later fragments' tfdts follow from per-sample durations as usual. No `elst` is ever in play.
+
+Source `elst` patterns outside the leading-empty-edit shape — media-time offsets used for encoder priming, rate changes, trims — are not converged by MUXL and are tracked in `open-questions.md`. A source file with a priming `elst` (e.g. `media_time = 1024` for AAC) currently loses the priming metadata in the MUXL form; playback is offset by the priming duration until a separate sample-dropping normalization lands.
 
 ## Stripped Boxes
 

@@ -9,12 +9,12 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mp4_atom::{
-    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Edts, Elst, ElstEntry, Encode,
-    Esds, Ftyp, Hdlr, Header, Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom,
-    Stbl, Stco, Stsc, Stsd, Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
+    Atom, Av01, Av1c, Avc1, Avcc, Codec, Decode, Dinf, Dops, Dref, Encode, Esds, Ftyp, Hdlr, Header,
+    Mdhd, Mdia, Minf, Moov, Mp4a, Mvex, Mvhd, Opus, ReadAtom, ReadFrom, Stbl, Stco, Stsc, Stsd,
+    Stsz, StszSamples, Stts, Tkhd, Trak, Trex, Url, Visual, Vmhd, WriteTo,
 };
 
-use crate::catalog::{AudioTrackConfig, Catalog, EditEntry, VideoTrackConfig};
+use crate::catalog::{AudioTrackConfig, Catalog, VideoTrackConfig};
 use crate::error::{Error, Result};
 
 // Canonical timescale for mvhd (movie-level, not media-level)
@@ -207,49 +207,60 @@ pub fn read_moov<R: Read + Seek>(reader: &mut R) -> Result<Moov> {
     }
 }
 
-/// Extract a track's edit list, if present. Applies a v0→v1 sign fix for
-/// `media_time` values that look like v0-truncated negatives (most commonly
-/// `-1`, used for empty edits), which mp4-atom's decoder stores as
-/// `0xFFFFFFFF` regardless of source version.
-fn extract_edits(trak: &Trak) -> Option<Vec<EditEntry>> {
-    let elst = trak.edts.as_ref()?.elst.as_ref()?;
-    let mut out = Vec::with_capacity(elst.entries.len());
-    for e in &elst.entries {
-        // Sign-extend values that came from v0 as negative i32.
-        // mp4-atom decodes v0 u32 into u64 without sign extension, so values
-        // in [0x80000000, 0xFFFFFFFF] with upper 32 bits zero need fixing.
-        let mt_u = e.media_time;
-        let media_time = if (mt_u >> 32) == 0 && (mt_u & 0x8000_0000) != 0 {
-            (mt_u | 0xFFFF_FFFF_0000_0000) as i64
-        } else {
-            mt_u as i64
-        };
-        out.push(EditEntry {
-            segment_duration: e.segment_duration,
-            media_time,
-            media_rate: e.media_rate,
-            media_rate_fraction: e.media_rate_fraction,
-        });
+/// Derive a track's canonical presentation start offset from its `edts/elst`,
+/// expressed in the track's media timescale.
+///
+/// MUXL canonical form has no `elst` box. Instead, a track's presentation
+/// start offset (from source-file leading empty edits, typically used by clip
+/// editors for A/V alignment) is baked into the track's first-fragment `tfdt`
+/// and/or into a synthesized canonical `elst` in the flat MP4 moov.
+///
+/// This parses the input elst and returns the leading empty-edit duration,
+/// summed across consecutive `media_time == -1` entries at the start of the
+/// list, rescaled from the movie timescale into the track's media timescale.
+/// Any trailing non-empty entries contribute nothing (they define what media
+/// plays, not when presentation begins). Source patterns we recognize:
+///
+/// - no elst → 0
+/// - `(X, media_time=0)` → 0 (trivial identity)
+/// - `(D, media_time=-1), (X, media_time=0)` → rescale(D, movie_ts → track_ts)
+///   (LosslessCut-style alignment)
+///
+/// Other patterns (encoder-priming `media_time > 0`, rate changes, non-leading
+/// empty edits) are not converged here — see `open-questions.md`.
+pub(crate) fn start_offset_from_trak(trak: &Trak, movie_timescale: u32) -> u64 {
+    let Some(edts) = trak.edts.as_ref() else {
+        return 0;
+    };
+    let Some(elst) = edts.elst.as_ref() else {
+        return 0;
+    };
+    let track_ts = trak.mdia.mdhd.timescale as u64;
+    let movie_ts = movie_timescale as u64;
+    if track_ts == 0 || movie_ts == 0 {
+        return 0;
     }
-    if out.is_empty() { None } else { Some(out) }
+
+    let mut empty_movie_ticks: u64 = 0;
+    for entry in &elst.entries {
+        if is_empty_edit(entry.media_time) {
+            empty_movie_ticks += entry.segment_duration;
+        } else {
+            break;
+        }
+    }
+    // Rescale movie-timescale empty-edit duration → track media timescale.
+    // Uses round-to-nearest; leading empty edits are typically whole
+    // milliseconds in the 1000-tick movie timescale and rescale cleanly.
+    (empty_movie_ticks * track_ts + movie_ts / 2) / movie_ts
 }
 
-/// Build an Edts from our EditEntry list. mp4-atom always encodes v1, so a
-/// negative `media_time` passes through correctly as its i64 bit pattern.
-fn build_edts(edits: &[EditEntry]) -> Edts {
-    Edts {
-        elst: Some(Elst {
-            entries: edits
-                .iter()
-                .map(|e| ElstEntry {
-                    segment_duration: e.segment_duration,
-                    media_time: e.media_time as u64,
-                    media_rate: e.media_rate,
-                    media_rate_fraction: e.media_rate_fraction,
-                })
-                .collect(),
-        }),
-    }
+/// Recognize an `elst` empty-edit entry. mp4-atom decodes v0 media_time as
+/// `u32` zero-extended to `u64` (so `-1` becomes `0xFFFF_FFFF`), and decodes
+/// v1 as `i64` in u64 bit-pattern (so `-1` becomes `0xFFFF_FFFF_FFFF_FFFF`).
+/// Both encode "empty edit" per ISOBMFF.
+fn is_empty_edit(media_time_u64: u64) -> bool {
+    media_time_u64 == u32::MAX as u64 || media_time_u64 == u64::MAX
 }
 
 /// Extract video track config from a trak.
@@ -257,7 +268,6 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
 
-    let edits = extract_edits(trak);
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
             Codec::Avc1(avc1) => {
@@ -275,7 +285,6 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_height: avc1.visual.height as u32,
                     track_id,
                     timescale,
-                    edits,
                 }));
             }
             Codec::Av01(av01) => {
@@ -299,7 +308,6 @@ fn extract_video_config(trak: &Trak) -> Result<Option<VideoTrackConfig>> {
                     coded_height: av01.visual.height as u32,
                     track_id,
                     timescale,
-                    edits,
                 }));
             }
             _ => continue,
@@ -313,7 +321,6 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
     let track_id = trak.tkhd.track_id;
     let timescale = trak.mdia.mdhd.timescale;
 
-    let edits = extract_edits(trak);
     for codec in &trak.mdia.minf.stbl.stsd.codecs {
         match codec {
             Codec::Opus(opus) => {
@@ -325,7 +332,6 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     number_of_channels: opus.audio.channel_count as u32,
                     track_id,
                     timescale,
-                    edits,
                 }));
             }
             Codec::Mp4a(mp4a) => {
@@ -339,7 +345,6 @@ fn extract_audio_config(trak: &Trak) -> Result<Option<AudioTrackConfig>> {
                     number_of_channels: mp4a.audio.channel_count as u32,
                     track_id,
                     timescale,
-                    edits,
                 }));
             }
             _ => continue,
@@ -450,7 +455,7 @@ pub(crate) fn build_video_trak(config: &VideoTrackConfig) -> Result<Trak> {
             width: (config.coded_width as u16).into(),
             height: (config.coded_height as u16).into(),
         },
-        edts: config.edits.as_ref().map(|e| build_edts(e)),
+        edts: None,
         meta: None,
         mdia: Mdia {
             mdhd: Mdhd {
@@ -529,7 +534,7 @@ pub(crate) fn build_audio_trak(config: &AudioTrackConfig) -> Result<Trak> {
             width: 0u16.into(),
             height: 0u16.into(),
         },
-        edts: config.edits.as_ref().map(|e| build_edts(e)),
+        edts: None,
         meta: None,
         mdia: Mdia {
             mdhd: Mdhd {
@@ -707,40 +712,82 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_list_round_trips_through_init() {
-        // Inject a LosslessCut-style 9ms empty video edit into an otherwise
-        // normal catalog, round-trip through build_init_segment +
-        // catalog_from_mp4, and confirm the edit list survives.
+    fn test_init_never_emits_edts() {
+        // Canonical init segment never contains edts/elst — presentation
+        // offsets live in first-fragment tfdt instead. Use the h264-aac
+        // fixture, whose source audio track has media_time=1024 priming
+        // and whose video has a trivial (media_time=0) elst — neither
+        // should reach the init segment's moov.
+        use mp4_atom::FourCC;
+
         let data = read_fixture("h264-aac.mp4");
-        let mut catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
-
-        let (_, video) = catalog.video.iter_mut().next().unwrap();
-        // Two-entry elst: 9ms empty edit, then remainder starting at media_time 0.
-        video.edits = Some(vec![
-            EditEntry {
-                segment_duration: 9,
-                media_time: -1,
-                media_rate: 1,
-                media_rate_fraction: 0,
-            },
-            EditEntry {
-                segment_duration: 2000,
-                media_time: 0,
-                media_rate: 1,
-                media_rate_fraction: 0,
-            },
-        ]);
-
+        let catalog = catalog_from_mp4(Cursor::new(data)).unwrap();
         let init = build_init_segment(&catalog).unwrap();
-        let catalog2 = catalog_from_mp4(Cursor::new(init)).unwrap();
+        let moov = read_moov(&mut Cursor::new(&init)).unwrap();
 
-        let v2 = catalog2.video.values().next().unwrap();
-        let edits = v2.edits.as_ref().expect("edit list missing after round-trip");
-        assert_eq!(edits.len(), 2);
-        assert_eq!(edits[0].segment_duration, 9);
-        assert_eq!(edits[0].media_time, -1, "empty edit media_time must stay -1");
-        assert_eq!(edits[1].segment_duration, 2000);
-        assert_eq!(edits[1].media_time, 0);
+        for trak in &moov.trak {
+            assert!(
+                trak.edts.is_none(),
+                "track {} carried edts into init segment",
+                trak.tkhd.track_id
+            );
+        }
+        // Also confirm the raw bytes contain no `elst` box anywhere.
+        let elst_tag = FourCC::new(b"elst");
+        assert!(
+            !init.windows(4).any(|w| w == elst_tag.as_ref()),
+            "init segment bytes contained an elst tag"
+        );
+    }
+
+    #[test]
+    fn test_start_offset_from_trak_empty_edit() {
+        // Synthesize a trak with a leading 9ms empty edit (LosslessCut
+        // pattern) and confirm start_offset_from_trak returns the
+        // track-timescale equivalent.
+        use mp4_atom::{Edts, Elst, ElstEntry};
+
+        let data = read_fixture("h264-aac.mp4");
+        let moov = read_moov(&mut Cursor::new(&data)).unwrap();
+        let mut trak = moov.trak.iter().find(|t| t.mdia.hdlr.handler.as_ref() == b"vide")
+            .cloned().unwrap();
+        // Video timescale in this fixture is 15360.
+        let video_ts = trak.mdia.mdhd.timescale;
+        trak.edts = Some(Edts {
+            elst: Some(Elst {
+                entries: vec![
+                    ElstEntry {
+                        segment_duration: 9,
+                        media_time: u32::MAX as u64, // empty edit (-1)
+                        media_rate: 1,
+                        media_rate_fraction: 0,
+                    },
+                    ElstEntry {
+                        segment_duration: 2000,
+                        media_time: 0,
+                        media_rate: 1,
+                        media_rate_fraction: 0,
+                    },
+                ],
+            }),
+        });
+        let offset = start_offset_from_trak(&trak, 1000);
+        // 9 movie ticks @ 1000 → 9 * 15360 / 1000 = 138.24, rounds to 138.
+        assert_eq!(offset, 138);
+        // Priming-only elst (media_time > 0) does not contribute a leading
+        // offset; it's left to the CMAF priming question.
+        trak.edts = Some(Edts {
+            elst: Some(Elst {
+                entries: vec![ElstEntry {
+                    segment_duration: 2000,
+                    media_time: 1024,
+                    media_rate: 1,
+                    media_rate_fraction: 0,
+                }],
+            }),
+        });
+        assert_eq!(start_offset_from_trak(&trak, 1000), 0);
+        let _ = video_ts; // silence unused warning on early returns
     }
 
     #[test]

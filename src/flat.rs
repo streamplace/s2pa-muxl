@@ -38,14 +38,17 @@
 use std::io::Write;
 
 use mp4_atom::{
-    Co64, Ctts, CttsEntry, Encode, Ftyp, Mfhd, Moof, Moov, Mvhd, Stbl, Stsc, StscEntry, Stss, Stsz,
-    StszSamples, Stts, SttsEntry, Tfdt, Tfhd, Traf, Trak, Trun, TrunEntry, WriteTo,
+    Co64, Ctts, CttsEntry, Edts, Elst, ElstEntry, Encode, Ftyp, Mfhd, Moof, Moov, Mvhd, Stbl, Stsc,
+    StscEntry, Stss, Stsz, StszSamples, Stts, SttsEntry, Tfdt, Tfhd, Traf, Trak, Trun, TrunEntry,
+    WriteTo,
 };
 
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::fragment::extract_flat_track_info;
-use crate::init::{MOVIE_TIMESCALE, build_audio_trak, build_video_trak, read_moov};
+use crate::init::{
+    MOVIE_TIMESCALE, build_audio_trak, build_video_trak, read_moov, start_offset_from_trak,
+};
 use crate::io::{ReadAt, ReadAtCursor};
 
 /// Per-sample metadata for flat MP4 assembly.
@@ -63,6 +66,17 @@ pub struct FlatTrackPlan {
     pub track_id: u32,
     pub is_video: bool,
     pub samples: Vec<FlatSample>,
+    /// Presentation start offset in the track's media timescale.
+    ///
+    /// Baked into the track's first-fragment `tfdt` (so CMAF/Hang consumers
+    /// inherit the offset from the fragment bytes themselves) and into a
+    /// synthesized canonical `elst` in the flat MP4 moov (so non-fragmented
+    /// players honor the same offset).
+    ///
+    /// Typical source: a LosslessCut-style leading empty edit on one track
+    /// but not others. Pure codec-priming `media_time > 0` is left at 0
+    /// here and is tracked separately — see `open-questions.md`.
+    pub start_offset_ticks: u64,
 }
 
 /// Metadata returned from a flat MP4 write — file sizes, per-track fragment
@@ -172,6 +186,11 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
         catalog.video.values().map(|v| v.track_id).collect();
 
     // Initialize per-track plans.
+    //
+    // A MUXL fMP4's init segment has no edts/elst (canonical form), so
+    // leading presentation offsets are expected to live in the first
+    // fragment's tfdt. We recover that below by reading tfdt on each
+    // track's first traf.
     let mut track_plans: std::collections::BTreeMap<u32, FlatTrackPlan> =
         std::collections::BTreeMap::new();
     for tid in moov.trak.iter().map(|t| t.tkhd.track_id) {
@@ -181,6 +200,7 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 track_id: tid,
                 is_video: video_ids.contains(&tid),
                 samples: Vec::new(),
+                start_offset_ticks: 0,
             },
         );
     }
@@ -218,10 +238,18 @@ pub fn plan_from_fmp4<R: ReadAt + ?Sized>(
                 let track_id = traf.tfhd.track_id;
                 let trex = crate::fragment::trex_defaults(&moov, track_id);
 
-                // tfdt is parsed but not stored per-sample; the fMP4's decode
-                // timing is recovered implicitly from per-sample durations during
-                // hybrid re-emission.
-                let _ = traf.tfdt.as_ref().map(|t| t.base_media_decode_time);
+                // First tfdt seen on a track carries the presentation-start
+                // offset (MUXL fMP4 canonical form has no elst, so the
+                // offset lives here). Subsequent samples' decode times are
+                // recovered implicitly from per-sample durations during
+                // re-emission, so we only pick up the first one.
+                if let Some(tfdt) = traf.tfdt.as_ref() {
+                    if let Some(plan) = track_plans.get_mut(&track_id) {
+                        if plan.samples.is_empty() {
+                            plan.start_offset_ticks = tfdt.base_media_decode_time;
+                        }
+                    }
+                }
 
                 for trun in &traf.trun {
                     // With default-base-is-moof (MUXL fMP4 files), data_offset
@@ -308,6 +336,7 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
     let video_ids: std::collections::HashSet<u32> =
         catalog.video.values().map(|v| v.track_id).collect();
 
+    let movie_ts = moov.mvhd.timescale;
     let mut plans = Vec::new();
     for trak in &moov.trak {
         let track_id = trak.tkhd.track_id;
@@ -322,10 +351,15 @@ pub fn plan_from_flat_mp4<R: ReadAt + ?Sized>(
                 input_offset: s.file_offset,
             })
             .collect();
+        // Bake the source track's leading empty edit into the plan — it
+        // becomes the track's first-fragment tfdt (and a canonical
+        // synthesized elst in the flat MP4 moov). See start_offset_from_trak.
+        let start_offset_ticks = start_offset_from_trak(trak, movie_ts);
         plans.push(FlatTrackPlan {
             track_id,
             is_video: video_ids.contains(&track_id),
             samples,
+            start_offset_ticks,
         });
     }
     plans.sort_by_key(|p| p.track_id);
@@ -360,16 +394,18 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
 
     // Pass 1: measure each inner moof's size so we know per-sample byte layout.
     // mfhd sequence numbers increment globally across all tracks, matching the
-    // fMP4 emitter.
+    // fMP4 emitter. The initial decode_time per track is the plan's
+    // start_offset_ticks — baking any leading-empty-edit presentation offset
+    // into the first-fragment tfdt.
     let mut per_sample_moof_sizes: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
     let mut per_track_byte_totals: Vec<u64> = Vec::with_capacity(ordered.len());
     let mut seq: u32 = 1;
-    let mut per_track_decode_time: Vec<u64> = vec![0; ordered.len()];
+    let mut per_track_final_decode_time: Vec<u64> = vec![0; ordered.len()];
 
     for (ti, plan) in ordered.iter().enumerate() {
         let mut sizes = Vec::with_capacity(plan.samples.len());
         let mut track_bytes: u64 = 0;
-        let mut dt: u64 = 0;
+        let mut dt: u64 = plan.start_offset_ticks;
 
         for sample in &plan.samples {
             let moof_size = measure_frame_moof(seq, plan.track_id, dt, sample)?;
@@ -380,7 +416,7 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
         }
         per_sample_moof_sizes.push(sizes);
         per_track_byte_totals.push(track_bytes);
-        per_track_decode_time[ti] = dt;
+        per_track_final_decode_time[ti] = dt;
     }
 
     // Build base traks (tkhd + mdia + empty stbl) from catalog.
@@ -393,7 +429,10 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     }
 
     // Populate sample tables with placeholder co64 (correct length, zero
-    // values — moov size is invariant under co64 value changes).
+    // values — moov size is invariant under co64 value changes). Durations
+    // exclude the leading start_offset (which lives in the synthesized elst,
+    // not in the media timeline) — `mdhd.duration` is the sum of sample
+    // durations, `tkhd.duration` is that plus the presentation offset.
     for (ti, plan) in ordered.iter().enumerate() {
         let n = plan.samples.len() as u32;
         populate_stbl(
@@ -401,12 +440,21 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
             plan,
             &vec![0u64; n as usize],
         );
-        let media_duration = per_track_decode_time[ti];
+        let media_duration = per_track_final_decode_time[ti] - plan.start_offset_ticks;
         traks[ti].mdia.mdhd.duration = media_duration;
-        traks[ti].tkhd.duration = rescale_to_movie(media_duration, track_ts[ti]);
+        // Synthesize a canonical elst for non-zero presentation offsets so
+        // flat-MP4 players honor the same start offset baked into the
+        // first-fragment tfdt. Spec: canonical-form.md § edts/elst.
+        traks[ti].edts =
+            build_canonical_elst(plan.start_offset_ticks, media_duration, track_ts[ti]);
+        let tkhd_duration = rescale_to_movie(
+            media_duration + plan.start_offset_ticks,
+            track_ts[ti],
+        );
+        traks[ti].tkhd.duration = tkhd_duration;
     }
 
-    let movie_duration: u64 = per_track_decode_time
+    let movie_duration: u64 = per_track_final_decode_time
         .iter()
         .zip(&track_ts)
         .map(|(md, ts)| rescale_to_movie(*md, *ts))
@@ -508,7 +556,7 @@ pub fn write_flat_mp4<R: ReadAt + ?Sized, W: Write>(
     let mut io_buf = vec![0u8; 256 * 1024];
     let mut seq: u32 = 1;
     for (ti, plan) in ordered.iter().enumerate() {
-        let mut dt: u64 = 0;
+        let mut dt: u64 = plan.start_offset_ticks;
         for (si, sample) in plan.samples.iter().enumerate() {
             let size = sample.size as usize;
             if io_buf.len() < size {
@@ -770,6 +818,48 @@ fn rescale_to_movie(media_duration: u64, media_timescale: u32) -> u64 {
         / ts
 }
 
+/// Build a canonical `edts/elst` for a flat MP4 track.
+///
+/// Returns `None` when `start_offset_track_ts == 0` — the common case where
+/// no presentation offset is needed. Otherwise, emits the canonical two-entry
+/// form: an empty edit for the offset, then a normal entry covering the
+/// media duration.
+///
+/// `segment_duration` values are in the movie timescale (per ISOBMFF),
+/// `media_time` in the track's media timescale.
+///
+/// Empty-edit `media_time` is encoded as `u64::MAX` (the v1 signed `-1` bit
+/// pattern); mp4-atom always writes v1.
+fn build_canonical_elst(
+    start_offset_track_ts: u64,
+    media_duration_track_ts: u64,
+    media_timescale: u32,
+) -> Option<Edts> {
+    if start_offset_track_ts == 0 {
+        return None;
+    }
+    let empty_movie = rescale_to_movie(start_offset_track_ts, media_timescale);
+    let normal_movie = rescale_to_movie(media_duration_track_ts, media_timescale);
+    Some(Edts {
+        elst: Some(Elst {
+            entries: vec![
+                ElstEntry {
+                    segment_duration: empty_movie,
+                    media_time: u64::MAX,
+                    media_rate: 1,
+                    media_rate_fraction: 0,
+                },
+                ElstEntry {
+                    segment_duration: normal_movie,
+                    media_time: 0,
+                    media_rate: 1,
+                    media_rate_fraction: 0,
+                },
+            ],
+        }),
+    })
+}
+
 fn mp4_err(e: mp4_atom::Error) -> Error {
     Error::InvalidMp4(e.to_string())
 }
@@ -1024,45 +1114,105 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_preserves_edit_list_round_trip() {
-        // Simulate the LosslessCut scenario: start from a fixture, inject a
-        // 9ms empty video edit into the catalog, build a fresh hybrid flat
-        // MP4, and verify the output's catalog carries the same edit list.
-        // This is the fragments+catalog round-trip a real flow does.
-        use crate::catalog::EditEntry;
+    fn hybrid_bakes_leading_empty_edit_into_tfdt_and_elst() {
+        // LosslessCut scenario: one track has a 9ms leading empty edit.
+        // After normalization, the canonical flat MP4 should have:
+        //   - A synthesized 2-entry elst in that track's moov trak
+        //   - The inner first moof for that track carrying tfdt=138 (9ms
+        //     at 15360 video timescale)
+        // Both views agree on the presentation offset; no per-sample bytes
+        // change.
+        use mp4_atom::FourCC;
 
         let flat_input = FileReadAt::open(&fixture_path("h264-aac.mp4")).unwrap();
-        let (mut catalog, plans) = plan_from_flat_mp4(&flat_input).unwrap();
-
-        let (_, video) = catalog.video.iter_mut().next().unwrap();
-        video.edits = Some(vec![
-            EditEntry {
-                segment_duration: 9,
-                media_time: -1,
-                media_rate: 1,
-                media_rate_fraction: 0,
-            },
-            EditEntry {
-                segment_duration: 2000,
-                media_time: 0,
-                media_rate: 1,
-                media_rate_fraction: 0,
-            },
-        ]);
+        let (catalog, mut plans) = plan_from_flat_mp4(&flat_input).unwrap();
+        // Pick the video plan (matches the catalog video track_id).
+        let video_track_id = catalog.video.values().next().unwrap().track_id;
+        let video_ts = catalog.video.values().next().unwrap().timescale;
+        for plan in &mut plans {
+            if plan.track_id == video_track_id {
+                // 9 ms in movie timescale (1000) → 138 ticks in video timescale (15360).
+                plan.start_offset_ticks = 138;
+            }
+        }
 
         let mut out = Vec::new();
         write_flat_mp4(&catalog, &plans, &flat_input, &mut out).unwrap();
 
-        let out_catalog = crate::catalog_from_mp4(Cursor::new(&out)).unwrap();
-        let out_video = out_catalog.video.values().next().unwrap();
-        let edits = out_video
-            .edits
+        // 1. The output moov contains a canonical 2-entry elst on the video trak.
+        let moov = read_moov(&mut Cursor::new(&out)).unwrap();
+        let video_trak = moov
+            .trak
+            .iter()
+            .find(|t| t.tkhd.track_id == video_track_id)
+            .expect("video trak missing");
+        let elst = video_trak
+            .edts
             .as_ref()
-            .expect("hybrid output should preserve video edit list");
-        assert_eq!(edits.len(), 2);
-        assert_eq!(edits[0].segment_duration, 9);
-        assert_eq!(edits[0].media_time, -1);
-        assert_eq!(edits[1].segment_duration, 2000);
+            .and_then(|e| e.elst.as_ref())
+            .expect("video trak should have synthesized elst");
+        assert_eq!(elst.entries.len(), 2);
+        // Leading empty edit: segment_duration in movie timescale (≈9ms),
+        // media_time is v1 -1 (u64::MAX).
+        assert_eq!(elst.entries[0].segment_duration, 9);
+        assert_eq!(elst.entries[0].media_time, u64::MAX);
+        assert_eq!(elst.entries[1].media_time, 0);
+        // Audio trak (no offset) gets no elst.
+        let audio_trak = moov
+            .trak
+            .iter()
+            .find(|t| t.tkhd.track_id != video_track_id)
+            .expect("audio trak missing");
+        assert!(
+            audio_trak.edts.is_none(),
+            "audio trak should not get a synthesized elst"
+        );
+
+        // 2. The first video inner moof carries tfdt = start_offset_ticks.
+        let first_tfdt = find_first_tfdt_for_track(&out, video_track_id).unwrap();
+        assert_eq!(first_tfdt, 138);
+
+        // 3. And for good measure, the ftyp and overall file still parse.
+        assert!(out.windows(4).any(|w| w == FourCC::new(b"ftyp").as_ref()));
+        let _ = video_ts;
+    }
+
+    /// Scan a canonical MUXL flat MP4 for the first inner `moof` whose `traf`
+    /// matches `track_id`, and return the `tfdt.base_media_decode_time`.
+    fn find_first_tfdt_for_track(bytes: &[u8], track_id: u32) -> Option<u64> {
+        use mp4_atom::{Atom, FourCC, Header, Moof, ReadAtom, ReadFrom};
+        use std::io::{Cursor, Seek, SeekFrom};
+
+        let mut cursor = Cursor::new(bytes);
+        let len = bytes.len() as u64;
+        let mut pos: u64 = 0;
+        while pos < len {
+            cursor.seek(SeekFrom::Start(pos)).ok()?;
+            let header = <Option<Header> as ReadFrom>::read_from(&mut cursor).ok()??;
+            let body = header.size? as u64;
+            let after_header = cursor.seek(SeekFrom::Current(0)).ok()?;
+            let total = (after_header - pos) + body;
+            if header.kind == Moof::KIND {
+                let moof = Moof::read_atom(&header, &mut cursor).ok()?;
+                for traf in &moof.traf {
+                    if traf.tfhd.track_id == track_id {
+                        return traf.tfdt.as_ref().map(|t| t.base_media_decode_time);
+                    }
+                }
+            } else if header.kind == FourCC::new(b"mdat") {
+                // Descend into the outer envelope so we see the inner moofs.
+                let _ = body;
+            }
+            // For both top-level mdat (envelope) and other boxes, stepping
+            // past the header is enough — the outer mdat's payload IS the
+            // inner moof+mdat sequence we want to scan.
+            if header.kind == FourCC::new(b"mdat") {
+                pos = after_header; // step into envelope payload
+            } else {
+                pos = pos + total;
+            }
+        }
+        None
     }
 
     #[test]

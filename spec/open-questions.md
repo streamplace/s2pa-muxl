@@ -32,7 +32,7 @@ Timescale passthrough is fine for the livestream ingest use case (single source 
 
 ## Audio priming sample handling
 
-Edit lists (including empty edits used for priming / A/V alignment) are currently preserved from source to output verbatim. This means the MUXL fMP4 and flat MP4 both carry whatever `elst` the source had. This resolves simple cases (e.g., a LosslessCut clip with a 9 ms empty video edit) but doesn't converge encoder-specific priming conventions.
+Leading empty edits (the LosslessCut A/V-alignment case) are now baked into the first fragment's `tfdt` and re-emitted as a canonical synthesized `elst` in the flat MP4 moov — see `canonical-form.md § edts/elst`. Priming (a single elst entry with `media_time > 0`, used for encoder delay) is still unresolved.
 
 Muxers still disagree on how to handle Opus/AAC encoder delay (priming samples):
 
@@ -41,13 +41,15 @@ Muxers still disagree on how to handle Opus/AAC encoder delay (priming samples):
 
 The decoded audio is the same — they just disagree on whether priming data lives in the file.
 
-Options:
+Current MUXL behavior: drop the priming `elst` on ingest. Fragments contain all source samples including priming; first-fragment `tfdt = 0`. Playback is offset by the priming duration (≈ 21.3 ms for AAC, ≈ 6.5 ms for Opus). Test fixtures with priming regress by that amount vs. the earlier passthrough approach — acceptable since the LosslessCut case (the user-visible one) is correct.
 
-1. **Normalize edit list representation only** (safe, doesn't touch mdat) — always use single-entry elst with media_time offset. Doesn't converge gstreamer and ffmpeg since actual sample data differs.
-2. **Always strip priming samples** — detect encoder delay from edit list, drop those samples from mdat, adjust stsz/stts/stco, set media_time=0. Would converge all muxers but requires correctly interpreting every edit list pattern. Risk of double-trimming if upstream already trimmed but didn't update the edit list.
-3. **Always keep priming samples** — can't reconstruct stripped data, so only works as a "don't strip" rule.
+Options for full convergence:
 
-Leaning toward option 2 with good test coverage, but needs more investigation.
+1. **Strip priming samples on ingest** — detect encoder delay from the source elst, drop leading samples whose cumulative duration `≤ media_time`, set first-fragment `tfdt = 0`. Converges ffmpeg with gstreamer exactly when `media_time` is a whole number of samples. Risk of double-trimming if upstream already trimmed but didn't update the elst.
+2. **Partial-sample priming** (e.g. Opus `media_time=312` with sample duration `960`): needs either a separate `priming_samples` scalar in the MUXL catalog or acceptance of the current glitch.
+3. **Trust source** — keep the priming `elst` in MUXL canonical form (the old passthrough). Doesn't converge muxers and leaves the `edits` field ambiguous in the wire catalog.
+
+Leaning toward option 1 for whole-sample priming plus a `priming_samples` catalog scalar for the partial case, but not yet implemented.
 
 ## Final Opus packet duration
 

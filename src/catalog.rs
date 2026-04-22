@@ -20,24 +20,6 @@ pub struct Catalog {
     pub audio: BTreeMap<String, AudioTrackConfig>,
 }
 
-/// A single entry in a track's edit list (elst).
-///
-/// Encodes a piece of the presentation timeline. `media_time = -1` marks an
-/// empty edit (a gap — the track presents nothing for `segment_duration`
-/// ticks of the movie timescale, useful for aligning tracks that start at
-/// different times, as editors like LosslessCut do).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EditEntry {
-    /// Duration of this edit in the movie timescale (`mvhd.timescale`).
-    pub segment_duration: u64,
-    /// Start time within the track's media timescale, or `-1` for an empty edit.
-    pub media_time: i64,
-    /// Playback rate integer part (typically 1).
-    pub media_rate: u16,
-    /// Playback rate fractional part (typically 0).
-    pub media_rate_fraction: u16,
-}
-
 /// Configuration for a video track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoTrackConfig {
@@ -56,12 +38,6 @@ pub struct VideoTrackConfig {
     /// Media timescale (ticks per second). Sample durations in fragments are
     /// expressed in this timescale. Matches Hang catalog container.timescale.
     pub timescale: u32,
-    /// Optional edit list, preserved from the source for presentation-timeline
-    /// fidelity (e.g. empty edits for A/V alignment from clip editors).
-    /// Serialization is skipped — this is carried through file-to-file
-    /// transforms but not across the wire catalog.
-    #[serde(skip)]
-    pub edits: Option<Vec<EditEntry>>,
 }
 
 /// Configuration for an audio track.
@@ -81,8 +57,4 @@ pub struct AudioTrackConfig {
     /// Media timescale (ticks per second). Sample durations in fragments are
     /// expressed in this timescale. Matches Hang catalog container.timescale.
     pub timescale: u32,
-    /// Optional edit list, preserved from the source for presentation-timeline
-    /// fidelity.
-    #[serde(skip)]
-    pub edits: Option<Vec<EditEntry>>,
 }
