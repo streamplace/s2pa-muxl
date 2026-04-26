@@ -6,8 +6,14 @@
 //! signature covers the cross-track manifest and whose ingredient manifests
 //! verify each track independently — drop a track and the rest still verify.
 //!
-//! Public API lands in follow-up commits.
+//! Entry points:
+//! - [`SignerKey`] — PEM cert chain + private key + signing alg.
+//! - [`sign_per_track`] — split a multi-track [`muxl::Source`] into per-track
+//!   flat MP4s, sign each, and combine into a wrapper signed flat MP4.
 
-// Smoke import: confirms the c2pa-rs streamplace fork resolves and links.
-#[doc(hidden)]
+mod error;
+mod sign;
+
 pub use c2pa::SigningAlg;
+pub use error::{Error, Result};
+pub use sign::{SignerKey, sign_per_track};
